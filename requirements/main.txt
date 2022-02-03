@@ -1268,3 +1268,4 @@ setuptools==59.6.0 \
     #   zope.deprecation
     #   zope.interface
     #   zope.sqlalchemy
+wtforms>=3.0.0a1 # not directly required, pinned by Snyk to avoid a vulnerability
