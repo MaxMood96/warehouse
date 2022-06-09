@@ -44,7 +44,7 @@
     "jquery": "3.5.0",
     "normalize.css": "^8.0.1",
     "stimulus": "1.1.1",
-    "uglify-js": "3.2.1",
+    "uglify-js": "3.13.10",
     "vinyl-named": "1.1.0",
     "webpack": "^4.42.1",
     "webpack-stream": "^5.0.0",
