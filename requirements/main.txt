@@ -1337,7 +1337,7 @@ wtforms[email]==3.0.1 \
     --hash=sha256:6b351bbb12dd58af57ffef05bc78425d08d1914e0fd68ee14143b7ade023c5bc \
     --hash=sha256:837f2f0e0ca79481b92884962b914eba4e72b7a2daaf1f939c890ed0124b834b
     # via -r requirements/main.in
-yara-python==4.2.0 \
+yara-python==4.2.3 \
     --hash=sha256:0de9d9482a6def6ef719ac9024dceae89809fa05d02656518a146374df93eb94 \
     --hash=sha256:1faec6480be87964056ac19cddae052da4c88755426c81c83bce53ed7d57ebfe \
     --hash=sha256:300581837e17114432d52599075bb8348dc2ce3e9ec8d3c325f5a797424791a4 \
