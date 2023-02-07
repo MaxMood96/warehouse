@@ -173,6 +173,10 @@ types-certifi==2021.10.8.3 \
     --hash=sha256:72cf7798d165bc0b76e1c10dd1ea3097c7063c42c21d664523b928e88b554a4f \
     --hash=sha256:b2d1e325e69f71f7c78e5943d410e650b4707bb0ef32e4ddf3da37f54176e88a
     # via -r requirements/lint.in
+types-docutils==0.19.1.3 \
+    --hash=sha256:36fe30de56f1ece1a9f7a990d47daa781b5af831d2b3f2dcb7dfd01b857cc3d4 \
+    --hash=sha256:d608e6b91ccf0e8e01c586a0af5b0e0462382d3be65b734af82d40c9d010735d
+    # via types-setuptools
 types-first==2.0.5 \
     --hash=sha256:4ef3d7370b9d8459ff78a55faa71f7d1d1694f447d195097006fb236aa973e85 \
     --hash=sha256:af9e144d9b2039d939237a0486670b22a9907df79d67bdbb3e4cb9f9ead3e5f4
@@ -215,9 +219,9 @@ types-s3transfer==0.6.0.post5 \
     --hash=sha256:2cf1e07cf4d1a5a2a68d89c654f45d9c3b678d39f7fe03a6f36903b6dbd3bcbc \
     --hash=sha256:cfcbee11c16d60af3feb3dbffea3a85b32129235b562912dece310a45ae83a2c
     # via boto3-stubs
-types-setuptools==65.6.0.2 \
-    --hash=sha256:2c2b4f756f79778074ce2d21f745aa737b12160d9f8dfa274f47a7287c7a2fee \
-    --hash=sha256:ad60ccf01d626de9762224448f36c13e0660e863afd6dc11d979b3739a6c7d24
+types-setuptools==67.1.0.2 \
+    --hash=sha256:947ea9d25222330e47f56e8960955b36ae6b4d589da09ab50561f1ed5e22ab2f \
+    --hash=sha256:b6e908d8da75ae6f2e7ff854fc67d3c869a5edab9810798568228ea691d64050
     # via -r requirements/lint.in
 types-sqlalchemy-utils==1.0.1 \
     --hash=sha256:37016333faa0abab7d253805ecf9f605c24ea107b32dd3643014efb8e49be76d \
