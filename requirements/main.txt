@@ -1201,7 +1201,7 @@ pycurl==7.44.1 \
     # via
     #   -r requirements/main.in
     #   kombu
-pydantic==1.9.2 \
+pydantic==1.10.13 \
     --hash=sha256:1061c6ee6204f4f5a27133126854948e3b3d51fcc16ead2e5d04378c199b2f44 \
     --hash=sha256:19b5686387ea0d1ea52ecc4cffb71abb21702c5e5b2ac626fd4dbaa0834aa49d \
     --hash=sha256:2bd446bdb7755c3a94e56d7bdfd3ee92396070efa8ef3a34fab9579fe6aa1d84 \
