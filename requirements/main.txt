@@ -1046,7 +1046,7 @@ natsort==8.2.0 \
     --hash=sha256:04fe18fdd2b9e5957f19f687eb117f102ef8dde6b574764e536e91194bed4f5f \
     --hash=sha256:57f85b72c688b09e053cdac302dd5b5b53df5f73ae20b4874fcbffd8bf783d11
     # via -r requirements/main.in
-orjson==3.8.5 \
+orjson==3.9.15 \
     --hash=sha256:09f40add3c2d208e20f8bf185df38f992bf5092202d2d30eced8f6959963f1d5 \
     --hash=sha256:0b57bf72902d818506906e49c677a791f90dbd7f0997d60b14bc6c1ce4ce4cf9 \
     --hash=sha256:0e28330cc6d51741cad0edd1b57caf6c5531aff30afe41402acde0a03246b8ed \
