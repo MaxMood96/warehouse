@@ -12,15 +12,18 @@
 
 import datetime
 
-import elasticsearch
+import opensearchpy
 import pretend
 import pytest
+import sqlalchemy
 
 from pyramid.httpexceptions import (
     HTTPBadRequest,
     HTTPNotFound,
+    HTTPRequestEntityTooLarge,
     HTTPSeeOther,
     HTTPServiceUnavailable,
+    HTTPTooManyRequests,
 )
 from trove_classifiers import sorted_classifiers
 from webob.multidict import MultiDict
@@ -28,11 +31,14 @@ from webob.multidict import MultiDict
 from warehouse import views
 from warehouse.errors import WarehouseDenied
 from warehouse.packaging.models import ProjectFactory as DBProjectFactory
+from warehouse.rate_limiting.interfaces import IRateLimiter
+from warehouse.utils.row_counter import compute_row_counts
 from warehouse.views import (
     SecurityKeyGiveaway,
     current_user_indicator,
     flash_messages,
     forbidden,
+    forbidden_api,
     forbidden_include,
     force_status,
     health,
@@ -52,6 +58,17 @@ from warehouse.views import (
 from ..common.db.accounts import UserFactory
 from ..common.db.classifiers import ClassifierFactory
 from ..common.db.packaging import FileFactory, ProjectFactory, ReleaseFactory
+
+
+def _assert_has_cors_headers(headers):
+    assert headers["Access-Control-Allow-Origin"] == "*"
+    assert headers["Access-Control-Allow-Headers"] == (
+        "Content-Type, If-Match, If-Modified-Since, If-None-Match, "
+        "If-Unmodified-Since"
+    )
+    assert headers["Access-Control-Allow-Methods"] == "GET"
+    assert headers["Access-Control-Max-Age"] == "86400"
+    assert headers["Access-Control-Expose-Headers"] == "X-PyPI-Last-Serial"
 
 
 class TestHTTPExceptionView:
@@ -76,6 +93,7 @@ class TestHTTPExceptionView:
 
         assert response.status_code == status_code
         assert response.status == f"{status_code} My Cool Status"
+        _assert_has_cors_headers(response.headers)
         renderer.assert_()
 
     @pytest.mark.parametrize("status_code", [403, 404, 410, 500])
@@ -93,6 +111,7 @@ class TestHTTPExceptionView:
         assert response.status_code == status_code
         assert response.status == f"{status_code} My Cool Status"
         assert response.headers["Foo"] == "Bar"
+        _assert_has_cors_headers(response.headers)
         renderer.assert_()
 
     def test_renders_404_with_csp(self, pyramid_config):
@@ -113,6 +132,7 @@ class TestHTTPExceptionView:
             "frame-src": ["https://www.youtube-nocookie.com"],
             "script-src": ["https://www.youtube.com", "https://s.ytimg.com"],
         }
+        _assert_has_cors_headers(response.headers)
         renderer.assert_()
 
     def test_simple_404(self):
@@ -128,6 +148,7 @@ class TestHTTPExceptionView:
             assert response.status == "404 Not Found"
             assert response.content_type == "text/plain"
             assert response.text == "404 Not Found"
+            _assert_has_cors_headers(response.headers)
 
     def test_json_404(self):
         csp = {}
@@ -145,6 +166,7 @@ class TestHTTPExceptionView:
             assert response.status == "404 Not Found"
             assert response.content_type == "application/json"
             assert response.text == '{"message": "Not Found"}'
+            _assert_has_cors_headers(response.headers)
 
     def test_context_is_project(self, pyramid_config, monkeypatch):
         csp = {}
@@ -208,7 +230,7 @@ class TestForbiddenView:
         exc = pretend.stub(
             status_code=403, status="403 Forbidden", headers={}, result=pretend.stub()
         )
-        request = pretend.stub(authenticated_userid=1, context=None)
+        request = pretend.stub(user=pretend.stub(), context=None)
         resp = forbidden(exc, request)
         assert resp.status_code == 403
         renderer.assert_()
@@ -216,7 +238,7 @@ class TestForbiddenView:
     def test_logged_out_redirects_login(self):
         exc = pretend.stub()
         request = pretend.stub(
-            authenticated_userid=None,
+            user=None,
             path_qs="/foo/bar/?b=s",
             route_url=pretend.call_recorder(
                 lambda route, _query: "/accounts/login/?next=/foo/bar/%3Fb%3Ds"
@@ -229,12 +251,12 @@ class TestForbiddenView:
         assert resp.status_code == 303
         assert resp.headers["Location"] == "/accounts/login/?next=/foo/bar/%3Fb%3Ds"
 
-    @pytest.mark.parametrize("reason", ("owners_require_2fa", "pypi_mandates_2fa"))
+    @pytest.mark.parametrize("reason", ["manage_2fa_required"])
     def test_two_factor_required(self, reason):
         result = WarehouseDenied("Some summary", reason=reason)
         exc = pretend.stub(result=result)
         request = pretend.stub(
-            authenticated_userid=1,
+            user=pretend.stub(),
             session=pretend.stub(flash=pretend.call_recorder(lambda x, queue: None)),
             path_qs="/foo/bar/?b=s",
             route_url=pretend.call_recorder(
@@ -258,6 +280,33 @@ class TestForbiddenView:
             )
         ]
 
+    @pytest.mark.parametrize(
+        "requested_path",
+        ["/manage/projects/", "/manage/account/two-factor/", "/manage/organizations/"],
+    )
+    def test_unverified_email_redirects(self, requested_path):
+        result = WarehouseDenied("Some summary", reason="unverified_email")
+        exc = pretend.stub(result=result)
+        request = pretend.stub(
+            user=pretend.stub(),
+            session=pretend.stub(flash=pretend.call_recorder(lambda x, queue: None)),
+            path_qs=requested_path,
+            route_url=pretend.call_recorder(lambda route, _query: "/manage/account/"),
+            _=lambda x: x,
+        )
+
+        resp = forbidden(exc, request)
+
+        assert resp.status_code == 303
+        assert resp.location == "/manage/account/"
+        assert request.session.flash.calls == [
+            pretend.call(
+                "You must verify your **primary** email address before you "
+                "can perform this action.",
+                queue="error",
+            )
+        ]
+
     def test_generic_warehousedeined(self, pyramid_config):
         result = WarehouseDenied(
             "This project requires two factor authentication to be enabled "
@@ -271,7 +320,7 @@ class TestForbiddenView:
         exc = pretend.stub(
             status_code=403, status="403 Forbidden", headers={}, result=result
         )
-        request = pretend.stub(authenticated_userid=1, context=None)
+        request = pretend.stub(user=pretend.stub(), context=None)
         resp = forbidden(exc, request)
         assert resp.status_code == 403
         renderer.assert_()
@@ -289,6 +338,18 @@ class TestForbiddenIncludeView:
         assert resp.content_length == 0
 
 
+class TestForbiddenAPIView:
+    def test_forbidden_api(self):
+        exc = pretend.stub()
+        request = pretend.stub()
+
+        resp = forbidden_api(exc, request)
+
+        assert resp.status_code == 403
+        assert resp.content_type == "application/json"
+        assert resp.json_body == {"message": "Access was denied to this resource."}
+
+
 class TestServiceUnavailableView:
     def test_renders_503(self, pyramid_config, pyramid_request):
         renderer = pyramid_config.testing_add_renderer("503.html")
@@ -299,6 +360,7 @@ class TestServiceUnavailableView:
         assert resp.status_code == 503
         assert resp.content_type == "text/html"
         assert resp.body == b"A 503 Error"
+        _assert_has_cors_headers(resp.headers)
 
 
 def test_robotstxt(pyramid_request):
@@ -313,7 +375,6 @@ def test_opensearchxml(pyramid_request):
 
 class TestIndex:
     def test_index(self, db_request):
-
         project = ProjectFactory.create()
         release1 = ReleaseFactory.create(project=project)
         release1.created = datetime.date(2011, 1, 1)
@@ -325,6 +386,10 @@ class TestIndex:
             python_version="source",
         )
         UserFactory.create()
+
+        # Make sure that the task to update the database counts has been
+        # called.
+        compute_row_counts(db_request)
 
         assert index(db_request) == {
             "num_projects": 1,
@@ -413,20 +478,29 @@ def test_csi_sidebar_sponsor_logo():
 
 class TestSearch:
     @pytest.mark.parametrize("page", [None, 1, 5])
-    def test_with_a_query(self, monkeypatch, db_request, metrics, page):
+    def test_with_a_query(
+        self, monkeypatch, pyramid_services, db_request, metrics, page
+    ):
         params = MultiDict({"q": "foo bar"})
         if page is not None:
             params["page"] = page
         db_request.params = params
 
-        db_request.es = pretend.stub()
-        es_query = pretend.stub()
-        get_es_query = pretend.call_recorder(lambda *a, **kw: es_query)
-        monkeypatch.setattr(views, "get_es_query", get_es_query)
+        fake_rate_limiter = pretend.stub(
+            test=lambda *a: True, hit=lambda *a: True, resets_in=lambda *a: None
+        )
+        pyramid_services.register_service(
+            fake_rate_limiter, IRateLimiter, None, name="search"
+        )
+
+        db_request.opensearch = pretend.stub()
+        opensearch_query = pretend.stub()
+        get_opensearch_query = pretend.call_recorder(lambda *a, **kw: opensearch_query)
+        monkeypatch.setattr(views, "get_opensearch_query", get_opensearch_query)
 
         page_obj = pretend.stub(page_count=(page or 1) + 10, item_count=1000)
         page_cls = pretend.call_recorder(lambda *a, **kw: page_obj)
-        monkeypatch.setattr(views, "ElasticsearchPage", page_cls)
+        monkeypatch.setattr(views, "OpenSearchPage", page_cls)
 
         url_maker = pretend.stub()
         url_maker_factory = pretend.call_recorder(lambda request: url_maker)
@@ -439,11 +513,11 @@ class TestSearch:
             "applied_filters": [],
             "available_filters": [],
         }
-        assert get_es_query.calls == [
-            pretend.call(db_request.es, params.get("q"), "", [])
+        assert get_opensearch_query.calls == [
+            pretend.call(db_request.opensearch, params.get("q"), "", [])
         ]
         assert page_cls.calls == [
-            pretend.call(es_query, url_maker=url_maker, page=page or 1)
+            pretend.call(opensearch_query, url_maker=url_maker, page=page or 1)
         ]
         assert url_maker_factory.calls == [pretend.call(db_request)]
         assert metrics.histogram.calls == [
@@ -451,16 +525,25 @@ class TestSearch:
         ]
 
     @pytest.mark.parametrize("page", [None, 1, 5])
-    def test_with_classifiers(self, monkeypatch, db_request, metrics, page):
+    def test_with_classifiers(
+        self, monkeypatch, pyramid_services, db_request, metrics, page
+    ):
         params = MultiDict([("q", "foo bar"), ("c", "foo :: bar"), ("c", "fiz :: buz")])
         if page is not None:
             params["page"] = page
         db_request.params = params
 
-        es_query = pretend.stub()
-        db_request.es = pretend.stub()
-        get_es_query = pretend.call_recorder(lambda *a, **kw: es_query)
-        monkeypatch.setattr(views, "get_es_query", get_es_query)
+        fake_rate_limiter = pretend.stub(
+            test=lambda *a: True, hit=lambda *a: True, resets_in=lambda *a: None
+        )
+        pyramid_services.register_service(
+            fake_rate_limiter, IRateLimiter, None, name="search"
+        )
+
+        opensearch_query = pretend.stub()
+        db_request.opensearch = pretend.stub()
+        get_opensearch_query = pretend.call_recorder(lambda *a, **kw: opensearch_query)
+        monkeypatch.setattr(views, "get_opensearch_query", get_opensearch_query)
 
         classifier1 = ClassifierFactory.create(classifier="foo :: bar")
         classifier2 = ClassifierFactory.create(classifier="foo :: baz")
@@ -474,7 +557,7 @@ class TestSearch:
 
         page_obj = pretend.stub(page_count=(page or 1) + 10, item_count=1000)
         page_cls = pretend.call_recorder(lambda *a, **kw: page_obj)
-        monkeypatch.setattr(views, "ElasticsearchPage", page_cls)
+        monkeypatch.setattr(views, "OpenSearchPage", page_cls)
 
         url_maker = pretend.stub()
         url_maker_factory = pretend.call_recorder(lambda request: url_maker)
@@ -497,26 +580,36 @@ class TestSearch:
         }
         assert ("fiz", [classifier3.classifier]) not in search_view["available_filters"]
         assert page_cls.calls == [
-            pretend.call(es_query, url_maker=url_maker, page=page or 1)
+            pretend.call(opensearch_query, url_maker=url_maker, page=page or 1)
         ]
+
         assert url_maker_factory.calls == [pretend.call(db_request)]
-        assert get_es_query.calls == [
-            pretend.call(db_request.es, params.get("q"), "", params.getall("c"))
+        assert get_opensearch_query.calls == [
+            pretend.call(db_request.opensearch, params.get("q"), "", params.getall("c"))
         ]
         assert metrics.histogram.calls == [
             pretend.call("warehouse.views.search.results", 1000)
         ]
 
-    def test_returns_404_with_pagenum_too_high(self, monkeypatch, db_request, metrics):
+    def test_returns_404_with_pagenum_too_high(
+        self, monkeypatch, pyramid_services, db_request, metrics
+    ):
         params = MultiDict({"page": 15})
         db_request.params = params
 
-        es_query = pretend.stub()
-        db_request.es = pretend.stub(query=lambda *a, **kw: es_query)
+        fake_rate_limiter = pretend.stub(
+            test=lambda *a: True, hit=lambda *a: True, resets_in=lambda *a: None
+        )
+        pyramid_services.register_service(
+            fake_rate_limiter, IRateLimiter, None, name="search"
+        )
+
+        opensearch_query = pretend.stub()
+        db_request.opensearch = pretend.stub(query=lambda *a, **kw: opensearch_query)
 
         page_obj = pretend.stub(page_count=10, item_count=1000)
         page_cls = pretend.call_recorder(lambda *a, **kw: page_obj)
-        monkeypatch.setattr(views, "ElasticsearchPage", page_cls)
+        monkeypatch.setattr(views, "OpenSearchPage", page_cls)
 
         url_maker = pretend.stub()
         url_maker_factory = pretend.call_recorder(lambda request: url_maker)
@@ -526,21 +619,30 @@ class TestSearch:
             search(db_request)
 
         assert page_cls.calls == [
-            pretend.call(es_query, url_maker=url_maker, page=15 or 1)
+            pretend.call(opensearch_query, url_maker=url_maker, page=15 or 1)
         ]
         assert url_maker_factory.calls == [pretend.call(db_request)]
         assert metrics.histogram.calls == []
 
-    def test_raises_400_with_pagenum_type_str(self, monkeypatch, db_request, metrics):
+    def test_raises_400_with_pagenum_type_str(
+        self, monkeypatch, pyramid_services, db_request, metrics
+    ):
         params = MultiDict({"page": "abc"})
         db_request.params = params
 
-        es_query = pretend.stub()
-        db_request.es = pretend.stub(query=lambda *a, **kw: es_query)
+        fake_rate_limiter = pretend.stub(
+            test=lambda *a: True, hit=lambda *a: True, resets_in=lambda *a: None
+        )
+        pyramid_services.register_service(
+            fake_rate_limiter, IRateLimiter, None, name="search"
+        )
+
+        opensearch_query = pretend.stub()
+        db_request.opensearch = pretend.stub(query=lambda *a, **kw: opensearch_query)
 
         page_obj = pretend.stub(page_count=10, item_count=1000)
         page_cls = pretend.call_recorder(lambda *a, **kw: page_obj)
-        monkeypatch.setattr(views, "ElasticsearchPage", page_cls)
+        monkeypatch.setattr(views, "OpenSearchPage", page_cls)
 
         url_maker = pretend.stub()
         url_maker_factory = pretend.call_recorder(lambda request: url_maker)
@@ -552,17 +654,47 @@ class TestSearch:
         assert page_cls.calls == []
         assert metrics.histogram.calls == []
 
-    def test_returns_503_when_es_unavailable(self, monkeypatch, db_request, metrics):
+    def test_return_413_when_query_too_long(
+        self, pyramid_services, db_request, metrics
+    ):
+        params = MultiDict({"q": "a" * 1001})
+        db_request.params = params
+
+        fake_rate_limiter = pretend.stub(
+            test=lambda *a: True, hit=lambda *a: True, resets_in=lambda *a: None
+        )
+        pyramid_services.register_service(
+            fake_rate_limiter, IRateLimiter, None, name="search"
+        )
+
+        with pytest.raises(HTTPRequestEntityTooLarge):
+            search(db_request)
+
+        assert metrics.increment.calls == [
+            pretend.call("warehouse.search.ratelimiter.hit"),
+            pretend.call("warehouse.views.search.error", tags=["error:query_too_long"]),
+        ]
+
+    def test_returns_503_when_opensearch_unavailable(
+        self, monkeypatch, pyramid_services, db_request, metrics
+    ):
         params = MultiDict({"page": 15})
         db_request.params = params
 
-        es_query = pretend.stub()
-        db_request.es = pretend.stub(query=lambda *a, **kw: es_query)
+        fake_rate_limiter = pretend.stub(
+            test=lambda *a: True, hit=lambda *a: True, resets_in=lambda *a: None
+        )
+        pyramid_services.register_service(
+            fake_rate_limiter, IRateLimiter, None, name="search"
+        )
+
+        opensearch_query = pretend.stub()
+        db_request.opensearch = pretend.stub(query=lambda *a, **kw: opensearch_query)
 
         def raiser(*args, **kwargs):
-            raise elasticsearch.ConnectionError()
+            raise opensearchpy.ConnectionError()
 
-        monkeypatch.setattr(views, "ElasticsearchPage", raiser)
+        monkeypatch.setattr(views, "OpenSearchPage", raiser)
 
         url_maker = pretend.stub()
         url_maker_factory = pretend.call_recorder(lambda request: url_maker)
@@ -572,8 +704,46 @@ class TestSearch:
             search(db_request)
 
         assert url_maker_factory.calls == [pretend.call(db_request)]
-        assert metrics.increment.calls == [pretend.call("warehouse.views.search.error")]
+        assert metrics.increment.calls == [
+            pretend.call("warehouse.search.ratelimiter.hit"),
+            pretend.call("warehouse.views.search.error"),
+        ]
         assert metrics.histogram.calls == []
+
+    @pytest.mark.parametrize("resets_in", [None, 1, 5])
+    def test_returns_429_when_ratelimited(
+        self, monkeypatch, pyramid_services, db_request, metrics, resets_in
+    ):
+        params = MultiDict({"q": "foo bar"})
+        db_request.params = params
+
+        fake_rate_limiter = pretend.stub(
+            test=lambda *a: False,
+            hit=lambda *a: True,
+            resets_in=lambda *a: (
+                None
+                if resets_in is None
+                else pretend.stub(total_seconds=lambda *a: resets_in)
+            ),
+        )
+        pyramid_services.register_service(
+            fake_rate_limiter, IRateLimiter, None, name="search"
+        )
+
+        with pytest.raises(HTTPTooManyRequests) as exc_info:
+            search(db_request)
+
+        message = (
+            "Your search query could not be performed because there were too "
+            "many requests by the client."
+        )
+        if resets_in is not None:
+            message += f" Limit may reset in {resets_in} seconds."
+
+        assert exc_info.value.args[0] == message
+        assert metrics.increment.calls == [
+            pretend.call("warehouse.search.ratelimiter.exceeded")
+        ]
 
 
 def test_classifiers(db_request):
@@ -602,7 +772,13 @@ def test_health():
     )
 
     assert health(request) == "OK"
-    assert request.db.execute.calls == [pretend.call("SELECT 1")]
+    assert len(request.db.execute.calls) == 1
+    assert len(request.db.execute.calls[0].args) == 1
+    assert len(request.db.execute.calls[0].kwargs) == 0
+    assert isinstance(
+        request.db.execute.calls[0].args[0], sqlalchemy.sql.expression.TextClause
+    )
+    assert request.db.execute.calls[0].args[0].text == "SELECT 1"
 
 
 class TestForceStatus:
@@ -619,18 +795,8 @@ class TestSecurityKeyGiveaway:
     def test_default_response(self):
         assert SecurityKeyGiveaway(pretend.stub()).default_response == {}
 
-    def test_security_key_giveaway_not_found(self):
-        request = pretend.stub(registry=pretend.stub(settings={}))
-
-        with pytest.raises(HTTPNotFound):
-            SecurityKeyGiveaway(request).security_key_giveaway()
-
     def test_security_key_giveaway(self):
-        request = pretend.stub(
-            registry=pretend.stub(
-                settings={"warehouse.two_factor_mandate.available": True}
-            )
-        )
+        request = pretend.stub()
         view = SecurityKeyGiveaway(request)
 
         assert view.security_key_giveaway() == view.default_response

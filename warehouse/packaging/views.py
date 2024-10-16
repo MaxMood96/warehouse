@@ -16,9 +16,11 @@ from pyramid.view import view_config
 from sqlalchemy.exc import NoResultFound
 
 from warehouse.accounts.models import User
+from warehouse.authnz import Permissions
 from warehouse.cache.origin import origin_cache
-from warehouse.packaging.models import File, Project, Release, Role
-from warehouse.utils import readme
+from warehouse.observations.models import ObservationKind
+from warehouse.packaging.forms import SubmitMalwareObservationForm
+from warehouse.packaging.models import Description, File, Project, Release, Role
 
 
 @view_config(
@@ -84,16 +86,13 @@ def release_detail(release, request):
     if project.name != request.matchdict.get("name", project.name):
         return HTTPMovedPermanently(request.current_route_path(name=project.name))
 
-    # Grab the rendered description if it exists, and if it doesn't, then we will render
-    # it inline.
-    # TODO: Remove the fallback to rendering inline and only support displaying the
-    #       already rendered content.
-    if release.description.html:
-        description = release.description.html
-    else:
-        description = readme.render(
-            release.description.raw, release.description.content_type
-        )
+    # Grab the rendered description
+    description_html = (
+        request.db.query(Description.html)
+        .filter(Description.id == release.description_id)
+        .one()
+        .html
+    )
 
     # Get all of the maintainers for this project.
     maintainers = [
@@ -141,7 +140,7 @@ def release_detail(release, request):
     return {
         "project": project,
         "release": release,
-        "description": description,
+        "description": description_html,
         "files": sdists + bdists,
         "sdists": sdists,
         "bdists": bdists,
@@ -157,8 +156,64 @@ def release_detail(release, request):
     context=Project,
     renderer="includes/manage-project-button.html",
     uses_session=True,
-    permission="manage:project",
     has_translations=True,
 )
 def edit_project_button(project, request):
     return {"project": project}
+
+
+@view_config(
+    context=Project,
+    has_translations=True,
+    renderer="includes/packaging/submit-malware-report.html",
+    route_name="includes.submit_malware_report",
+    uses_session=True,
+)
+def includes_submit_malware_observation(project, request):
+    return {"project": project}
+
+
+@view_config(
+    context=Project,
+    has_translations=True,
+    permission=Permissions.SubmitMalwareObservation,
+    renderer="packaging/submit-malware-observation.html",
+    require_csrf=True,
+    require_methods=False,
+    route_name="packaging.project.submit_malware_observation",
+    uses_session=True,
+)
+def submit_malware_observation(
+    project,
+    request,
+    _form_class=SubmitMalwareObservationForm,
+):
+    """
+    Allow Authenticated users to submit malware reports (observations) about a project.
+    """
+    form = _form_class(request.GET)
+
+    if request.method == "POST":
+        form = _form_class(request.POST)
+
+        if form.validate():
+            project.record_observation(
+                request=request,
+                kind=ObservationKind.IsMalware,
+                actor=request.user,
+                summary=form.summary.data,
+                payload={
+                    "inspector_url": form.inspector_link.data,
+                    "origin": "web",
+                    "summary": form.summary.data,
+                },
+            )
+            request.session.flash(
+                request._("Your report has been recorded. Thank you for your help."),
+                queue="success",
+            )
+            return HTTPMovedPermanently(
+                request.route_path("packaging.project", name=project.name)
+            )
+
+    return {"form": form, "project": project}

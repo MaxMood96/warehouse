@@ -35,7 +35,7 @@
   {% set icon = "fab fa-gitlab" %}
 {% elif parsed.netloc == "gitter.im" or parsed.netloc.endswith(".gitter.im") %}
   {% set icon = "fab fa-gitter" %}
-{% elif parsed.netloc in ["discord.com", "discordapp.com", "discord.gg"] or parsed.netloc.endswith(("discord.com", "discordapp.com", "discord.gg")) %}
+{% elif parsed.netloc in ["discord.com", "discordapp.com", "discord.gg"] %}
   {% set icon = "fab fa-discord" %}
 {% elif parsed.netloc == "google.com" or parsed.netloc.endswith(".google.com") %}
   {% set icon = "fab fa-google" %}
@@ -45,15 +45,15 @@
   {% set icon = "fab fa-reddit-alien" %}
 {% elif name.lower().startswith("slack") or parsed.netloc == "slack.com" or parsed.netloc.endswith(".slack.com") %}
   {% set icon = "fab fa-slack" %}
-{% elif parsed.netloc == "twitter.com" or parsed.netloc.endswith(".twitter.com") %}
+{% elif parsed.netloc in ["twitter.com", "x.com"] or parsed.netloc.endswith((".twitter.com", ".x.com")) %}
   {% set icon = "fab fa-twitter" %}
-{% elif parsed.netloc in ["ci.appveyor.com", "circleci.com", "codecov.io", "coveralls.io", "shippable.com", "travis-ci.com", "travis-ci.org"] or parsed.netloc.endswith((".appveyor.com", ".circleci.com", ".codecov.io", ".coveralls.io", ".shippable.com", ".travis-ci.org", ".travis-ci.com")) %}
+{% elif parsed.netloc in ["ci.appveyor.com", "circleci.com", "codecov.io", "coveralls.io", "travis-ci.com", "travis-ci.org"] or parsed.netloc.endswith((".appveyor.com", ".circleci.com", ".codecov.io", ".coveralls.io", ".travis-ci.org", ".travis-ci.com")) %}
   {% set icon = "fas fa-tasks" %}
 {% elif parsed.netloc in ["cheeseshop.python.org", "pypi.io", "pypi.org", "pypi.python.org"] %}
   {% set icon = "fas fa-cube" %}
 {% elif parsed.netloc == "python.org" or parsed.netloc.endswith(".python.org") %}
   {% set icon = "fab fa-python" %}
-{% elif parsed.netloc == "youtube.com" or parsed.netloc.endswith(".youtube.com") %}
+{% elif parsed.netloc in ["youtube.com", "youtu.be"] or parsed.netloc.endswith((".youtube.com", ".youtu.be")) %}
   {% set icon = "fab fa-youtube" %}
 {% elif name|lower == "mastodon" %}
   {% set icon = "fab fa-mastodon" %}
@@ -108,11 +108,9 @@
         <a href="#copy-hash-modal-{{ file.id }}">{%- trans -%}view hashes{%- endtrans -%}</a>)
         <p class="file__meta">
           Uploaded {{ humanize(file.upload_time) }}
-          {% if file.python_version %}
-          {% for tag in file.python_version.split('.') %}
+          {% for tag in file.pretty_wheel_tags %}
           <code>{{ tag }}</code>
           {% endfor %}
-          {% endif %}
         </p>
       </div>
     </div>
@@ -137,14 +135,19 @@
 {% endblock %}
 
 {% block content %}
-{% csi request.route_path("includes.administer-project-include", project_name=project.normalized_name) %}
-{% endcsi %}
-{% if release.github_repo_info_url and release.github_open_issue_info_url %}
+{% if release.verified_github_repo_info_url and release.verified_github_open_issue_info_url %}
 <div class="hidden"
   data-controller="github-repo-stats"
   data-github-repo-stats-github-repo-info-outlet=".github-repo-info"
-  data-github-repo-stats-url-value="{{release.github_repo_info_url}}"
-  data-github-repo-stats-issue-url-value="{{release.github_open_issue_info_url}}">
+  data-github-repo-stats-url-value="{{release.verified_github_repo_info_url}}"
+  data-github-repo-stats-issue-url-value="{{release.verified_github_open_issue_info_url}}">
+</div>
+{% endif %}
+{% if release.verified_gitlab_repository %}
+<div class="hidden"
+  data-controller="gitlab-repo-stats"
+  data-gitlab-repo-stats-gitlab-repo-info-outlet=".gitlab-repo-info"
+  data-gitlab-repo-stats-repository-value="{{release.verified_gitlab_repository}}">
 </div>
 {% endif %}
 
@@ -155,19 +158,27 @@
         {{ release.project.name }} {{ release.version }}
       </h1>
 
-      {% if files %}
-      <p class="package-header__pip-instructions">
-        <span id="pip-command">{{ pip_command(release, request.matched_route.name, testPyPI) }}</span>
-        <button type="button" class="copy-tooltip copy-tooltip-s" data-clipboard-target="#pip-command" data-tooltip-label="{% trans %}Copy to clipboard{% endtrans %}">
-          <i class="fa fa-copy" aria-hidden="true"></i>
-          <span class="sr-only">{% trans %}Copy PIP instructions{% endtrans %}</span>
-        </button>
-      </p>
+      {% if files and not project.lifecycle_status == "quarantine-enter" %}
+      <div data-controller="clipboard">
+        <p class="package-header__pip-instructions">
+          <span id="pip-command" data-clipboard-target="source">{{ pip_command(release, request.matched_route.name, testPyPI) }}</span>
+          <button type="button" class="copy-tooltip copy-tooltip-s" data-action="clipboard#copy" data-clipboard-target="tooltip" data-clipboard-tooltip-value="{% trans %}Copy to clipboard{% endtrans %}">
+            <i class="fa fa-copy" aria-hidden="true"></i>
+            <span class="sr-only">{% trans %}Copy PIP instructions{% endtrans %}</span>
+          </button>
+        </p>
+      </div>
       {% endif %}
     </div>
 
     <div class="package-header__right">
-    {% if release.yanked %}
+    {% if project.lifecycle_status == "quarantine-enter" %}
+      <a class="status-badge status-badge--warn" href="{{ request.route_path('help') }}#project_in_quarantine">
+      <span>
+        {% trans %}This project has been quarantined{% endtrans %}
+      </span>
+      </a>
+    {% elif release.yanked %}
       <a class="status-badge status-badge--bad" href="{{ request.route_path('packaging.project', name=release.project.name) }}">
         <span>
           {% trans %}This release has been yanked{% endtrans %}<br>
@@ -197,6 +208,8 @@
 
 <div class="horizontal-section horizontal-section--grey horizontal-section--thin">
   <div class="site-container">
+{% csi request.route_path("includes.administer-project-include", project_name=project.normalized_name) %}
+{% endcsi %}
     <div class="split-layout split-layout--middle package-description">
     {% if release.summary %}
       <p class="package-description__summary">{{ release.summary }}</p>
@@ -241,7 +254,10 @@
           </nav>
         </div>
         {% include "warehouse:templates/includes/packaging/project-data.html" %}
+        {% set include_sponsor_logos = project.organization.orgtype != OrganizationType.Company %}
         {% include "warehouse:templates/includes/sidebar-sponsor-logo.html" %}
+        {% csi request.route_url("includes.submit_malware_report", project_name=project.name) %}
+        {% endcsi %}
 
       </div>
       <div class="vertical-tabs__panel">
@@ -279,6 +295,28 @@
 
         {# Tab: Project description #}
         <div id="description" data-project-tabs-target="content" class="vertical-tabs__content" role="tabpanel" aria-labelledby="description-tab mobile-description-tab" tabindex="-1">
+          {% if project.lifecycle_status == "quarantine-enter" %}
+            <div class="callout-block callout-block--warning">
+              <p>{% trans %}This project has been quarantined.{% endtrans %}</p>
+              <p>
+                {% trans %}
+                  PyPI Admins need to review this project before it can be restored.
+                  While in quarantine, the project is not installable by clients,
+                  and cannot be being modified by its maintainers.
+                {% endtrans %}
+              </p>
+              <p>
+                {% trans href=request.route_path('help') + "#project_in_quarantine" %}
+                  Read more in the <a href="{{ href }}">project in quarantine</a> help article.
+                {% endtrans %}
+              </p>
+            </div>
+          {% elif release.yanked and release.yanked_reason %}
+            <div class="callout-block callout-block--danger">
+              <p>{% trans %}Reason this release was yanked:{% endtrans %}</p>
+              <p>{{ release.yanked_reason }}</p>
+            </div>
+          {% endif %}
           <h2 class="page-title">{% trans %}Project description{% endtrans %}</h2>
           {% if description %}
           <div class="project-description">
@@ -348,6 +386,12 @@
                 <p class="release__version-date">
                   {{ humanize(hversion.created) }}
                 </p>
+                {% if hversion.yanked and hversion.yanked_reason %}
+                  <div class="callout-block callout-block--danger release__yanked-reason">
+                    <p>{% trans %}Reason this release was yanked:{% endtrans %}</p>
+                    <p>{{ hversion.yanked_reason }}</p>
+                  </div>
+                {% endif %}
               </a>
             </div>
             {% endfor %}
@@ -358,7 +402,7 @@
           {# Tab: Downloads #}
           <div id="files" data-project-tabs-target="content" class="vertical-tabs__content" role="tabpanel" aria-labelledby="files-tab mobile-files-tab" tabindex="-1">
             <h2 class="page-title">{% trans %}Download files{% endtrans %}</h2>
-            <p>{% trans href='https://packaging.python.org/installing/', title=gettext('External link') %}Download the file for your platform. If you're not sure which to choose, learn more about <a href="{{ href }}" title="{{ title }}" target="_blank" rel="noopener">installing packages</a>.{% endtrans %}</p>
+            <p>{% trans href='https://packaging.python.org/tutorials/installing-packages/', title=gettext('External link') %}Download the file for your platform. If you're not sure which to choose, learn more about <a href="{{ href }}" title="{{ title }}" target="_blank" rel="noopener">installing packages</a>.{% endtrans %}</p>
             <h3>
               {% trans count=sdists|length %}
                 Source Distribution

@@ -6,71 +6,122 @@ on:
   pull_request:
   merge_group:
     types: [checks_requested]
+  workflow_dispatch:  # generally only for the "combine-prs" workflow
 permissions:
+  id-token: write
   contents: read
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: true
 jobs:
+  build:
+    if: github.repository == 'pypi/warehouse'
+    runs-on: depot-ubuntu-22.04-arm
+    outputs:
+      buildId: ${{ steps.build.outputs.build-id}}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Depot CLI
+        uses: depot/setup-action@v1
+      - name: Build image
+        id: build
+        uses: depot/build-push-action@v1
+        with:
+          save: true
+          build-args: |
+            DEVEL=yes
+            CI=yes
+          tags: pypi/warehouse:ci-${{ github.run_id }}
   test:
+    # Time out if our test suite has gotten hung
+    timeout-minutes: 15
+    needs: build
     strategy:
       matrix:
         include:
           - name: Tests
-            command: bin/tests --postgresql-host localhost
+            command: bin/tests --postgresql-host postgres
           - name: Lint
             command: bin/lint
-          - name: Documentation
-            command: bin/docs
+          - name: User Documentation
+            command: bin/user-docs
+          - name: Developer Documentation
+            command: bin/dev-docs
           - name: Dependencies
-            command: bin/github-actions-deps
+            command: bin/deps
           - name: Licenses
             command: bin/licenses
           - name: Translations
             command: bin/translations
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-22.04-arm
+    container:
+      image: registry.depot.dev/rltf7cln5v:${{ needs.build.outputs.buildId }}
+      env:
+        BILLING_BACKEND: warehouse.subscriptions.services.MockStripeBillingService api_base=http://stripe:12111 api_version=2020-08-27
     services:
       postgres:
-        image: postgres:14.4
+        image: ${{ (matrix.name == 'Tests') && 'postgres:16.1' || '' }}
         ports:
           - 5432:5432
         env:
           POSTGRES_HOST_AUTH_METHOD: trust  # never do this in production!
+          POSTGRES_INITDB_ARGS: '--no-sync --set fsync=off --set full_page_writes=off'
         # Set health checks to wait until postgres has started
-        options: --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+        options: --health-cmd "pg_isready --username=postgres --dbname=postgres" --health-interval 10s --health-timeout 5s --health-retries 5
+      redis:
+        image: ${{ (matrix.name == 'Tests') && 'redis:7.0' || '' }}
+        ports:
+          - 6379:6379
       stripe:
-        image: stripe/stripe-mock:v0.140.0
+        image: ${{ (matrix.name == 'Tests') && 'stripe/stripe-mock:v0.162.0' || '' }}
         ports:
           - 12111:12111
     name: ${{ matrix.name }}
-    env:
-      BILLING_BACKEND: warehouse.subscriptions.services.MockStripeBillingService api_base=http://localhost:12111 api_version=2020-08-27
     steps:
       - name: Check out repository
-        uses: actions/checkout@v3
-      - name: Install platform dependencies
-        run: |
-          sudo apt -y update
-          sudo apt -y install libcurl4-openssl-dev libssl-dev pkg-config
-      - uses: actions/setup-python@v4
-        with:
-          python-version-file: '.python-version'
-          cache: 'pip'
-          cache-dependency-path: |
-            requirements.txt
-            requirements/*.txt
-      - name: Cache common Python cache paths
-        uses: actions/cache@v3
+        uses: actions/checkout@v4
+      - name: Cache mypy results
+        if: ${{ (matrix.name == 'Lint') }}
+        uses: actions/cache@v4
         with:
           path: |
-            .cache
-            .mypy_cache
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt', 'requirements/lint.txt') }}
-      - name: Install Python dependencies
-        run: |
-          pip install -U pip setuptools wheel
-          pip install -r requirements.txt --no-deps
-          pip install -r requirements/dev.txt
-          pip check
+              dev/.mypy_cache
+          key: ${{ runner.os }}-mypy-${{ env.pythonLocation }}-${{ hashFiles('requirements.txt', 'requirements/*.txt') }}
       - name: Run ${{ matrix.name }}
         run: ${{ matrix.command }}
+
+  check_db:
+    name: Check Database Consistency
+    needs: build
+    runs-on: depot-ubuntu-22.04-arm
+    continue-on-error: true
+    container:
+      image: registry.depot.dev/rltf7cln5v:${{ needs.build.outputs.buildId }}
+    services:
+      postgres:
+        image: postgres:16.1
+        ports:
+        - 5432:5432
+        env:
+          POSTGRES_DB: warehouse
+          POSTGRES_HOST_AUTH_METHOD: trust  # never do this in production!
+          POSTGRES_INITDB_ARGS: '--no-sync --set fsync=off --set full_page_writes=off'
+        # Set health checks to wait until postgres has started
+        options: --health-cmd "pg_isready --username=postgres --dbname=postgres" --health-interval 10s --health-timeout 5s --health-retries 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Dotenv Action
+        # We need to load the environment variables to run the CLI
+        id: dotenv
+        uses: falti/dotenv-action@v1
+        with:
+          path: dev/environment
+          export-variables: true
+          keys-case: upper
+      - name: Check Database
+        run: bin/db-check
+        env:
+          # override the hostname set in `dev/environment`
+          DATABASE_URL: 'postgresql+psycopg://postgres@postgres/warehouse'

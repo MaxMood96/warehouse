@@ -159,6 +159,38 @@ class TestCSPTween:
             )
         }
 
+    def test_admin_csp(self):
+        settings = {
+            "csp": {
+                "default-src": ["'none'"],
+                "frame-src": ["'none'"],
+                "img-src": ["'self'"],
+                "connect-src": [],
+            },
+            "camo.url": "http://localhost:9000",
+        }
+        response = pretend.stub(headers={})
+        registry = pretend.stub(settings=settings)
+        handler = pretend.call_recorder(lambda request: response)
+
+        tween = csp.content_security_policy_tween_factory(handler, registry)
+
+        request = pretend.stub(
+            path="/admin/",
+            find_service=pretend.call_recorder(lambda *args, **kwargs: settings["csp"]),
+            registry=registry,
+        )
+
+        assert tween(request) is response
+        assert response.headers == {
+            "Content-Security-Policy": (
+                "connect-src http://localhost:9000; "
+                "default-src 'none'; "
+                "frame-src https://inspector.pypi.io; "
+                "img-src 'self' data:"
+            )
+        }
+
 
 class TestCSPPolicy:
     def test_create(self):
@@ -166,7 +198,7 @@ class TestCSPPolicy:
         assert isinstance(policy, collections.defaultdict)
 
     @pytest.mark.parametrize(
-        "existing, incoming, expected",
+        ("existing", "incoming", "expected"),
         [
             (
                 {"foo": ["bar"]},
@@ -213,11 +245,11 @@ def test_includeme():
             {
                 "csp": {
                     "base-uri": ["'self'"],
-                    "block-all-mixed-content": [],
                     "connect-src": [
                         "'self'",
                         "https://api.github.com/repos/",
                         "https://api.github.com/search/issues",
+                        "https://gitlab.com/api/",
                         "https://*.google-analytics.com",
                         "https://*.analytics.google.com",
                         "https://*.googletagmanager.com",
@@ -240,6 +272,7 @@ def test_includeme():
                         "https://*.googletagmanager.com",
                         "*.fastly-insights.com",
                         "*.ethicalads.io",
+                        "ethicalads.blob.core.windows.net",
                     ],
                     "script-src": [
                         "'self'",
@@ -269,6 +302,33 @@ def test_includeme():
             }
         )
     ]
+
+
+def test_includeme_development():
+    """
+    Tests for development-centric CSP settings.
+    Not as extensive as the production tests.
+    """
+    config = pretend.stub(
+        register_service_factory=pretend.call_recorder(lambda fact, name: None),
+        add_settings=pretend.call_recorder(lambda settings: None),
+        add_tween=pretend.call_recorder(lambda tween: None),
+        registry=pretend.stub(
+            settings={
+                "camo.url": "camo.url.value",
+                "warehouse.env": "development",
+                "livereload.url": "http://localhost:35729",
+            }
+        ),
+    )
+    csp.includeme(config)
+
+    rendered_csp = config.add_settings.calls[0].args[0]["csp"]
+
+    assert config.registry.settings.get("warehouse.env") == "development"
+
+    assert "ws://localhost:35729/livereload" in rendered_csp["connect-src"]
+    assert "http://localhost:35729/livereload.js" in rendered_csp["script-src"]
 
 
 class TestFactory:

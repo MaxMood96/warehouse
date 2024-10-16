@@ -10,7 +10,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import collections
 import json
 import time
 import uuid
@@ -41,7 +40,7 @@ def test_invalid_token_leak_request():
 
 
 @pytest.mark.parametrize(
-    "record, error, reason",
+    ("record", "error", "reason"),
     [
         (None, "Record is not a dict but: None", "format"),
         ({}, "Record is missing attribute(s): token, type, url", "format"),
@@ -92,8 +91,7 @@ def test_token_leak_disclosure_request_from_api_record(source):
 
 
 class TestGitHubTokenScanningPayloadVerifier:
-    def test_init(self):
-        metrics = pretend.stub()
+    def test_init(self, metrics):
         session = pretend.stub()
         token = "api_token"
         url = "http://foo"
@@ -113,7 +111,7 @@ class TestGitHubTokenScanningPayloadVerifier:
         assert github_verifier._api_url == url
         assert github_verifier._public_keys_cache is cache
 
-    def test_verify_cache_miss(self):
+    def test_verify_cache_miss(self, metrics):
         # Example taken from
         # https://gist.github.com/ewjoachim/7dde11c31d9686ed6b4431c3ca166da2
         meta_payload = {
@@ -133,7 +131,6 @@ class TestGitHubTokenScanningPayloadVerifier:
             json=lambda: meta_payload, raise_for_status=lambda: None
         )
         session = pretend.stub(get=lambda *a, **k: response)
-        metrics = pretend.stub(increment=pretend.call_recorder(lambda str: None))
         cache = integrations.PublicKeysCache(cache_time=12)
         github_verifier = utils.GitHubTokenScanningPayloadVerifier(
             api_url="http://foo",
@@ -163,9 +160,8 @@ class TestGitHubTokenScanningPayloadVerifier:
             pretend.call("warehouse.token_leak.github.auth.success"),
         ]
 
-    def test_verify_cache_hit(self):
+    def test_verify_cache_hit(self, metrics):
         session = pretend.stub()
-        metrics = pretend.stub(increment=pretend.call_recorder(lambda str: None))
         cache = integrations.PublicKeysCache(cache_time=12)
         cache.cached_at = time.time()
         cache.cache = [
@@ -207,8 +203,7 @@ class TestGitHubTokenScanningPayloadVerifier:
             pretend.call("warehouse.token_leak.github.auth.success"),
         ]
 
-    def test_verify_error(self):
-        metrics = pretend.stub(increment=pretend.call_recorder(lambda str: None))
+    def test_verify_error(self, metrics):
         cache = integrations.PublicKeysCache(cache_time=12)
         github_verifier = utils.GitHubTokenScanningPayloadVerifier(
             api_url="http://foo",
@@ -248,7 +243,7 @@ class TestGitHubTokenScanningPayloadVerifier:
         )._headers_auth()
         assert headers == {"Authorization": "token api-token"}
 
-    def test_retrieve_public_key_payload(self):
+    def test_retrieve_public_key_payload(self, metrics):
         meta_payload = {
             "public_keys": [
                 {
@@ -266,7 +261,6 @@ class TestGitHubTokenScanningPayloadVerifier:
             json=lambda: meta_payload, raise_for_status=lambda: None
         )
         session = pretend.stub(get=pretend.call_recorder(lambda *a, **k: response))
-        metrics = pretend.stub(increment=pretend.call_recorder(lambda str: None))
 
         github_verifier = utils.GitHubTokenScanningPayloadVerifier(
             api_url="http://foo",
@@ -284,7 +278,6 @@ class TestGitHubTokenScanningPayloadVerifier:
         ]
 
     def test_get_cached_public_key_cache_hit(self):
-        metrics = pretend.stub()
         session = pretend.stub()
         cache = integrations.PublicKeysCache(cache_time=12)
         cache_value = pretend.stub()
@@ -293,21 +286,20 @@ class TestGitHubTokenScanningPayloadVerifier:
         github_verifier = utils.GitHubTokenScanningPayloadVerifier(
             api_url="http://foo",
             session=session,
-            metrics=metrics,
+            metrics=pretend.stub(),
             public_keys_cache=cache,
         )
 
         assert github_verifier._get_cached_public_keys() is cache_value
 
     def test_get_cached_public_key_cache_miss_no_cache(self):
-        metrics = pretend.stub()
         session = pretend.stub()
         cache = integrations.PublicKeysCache(cache_time=12)
 
         github_verifier = utils.GitHubTokenScanningPayloadVerifier(
             api_url="http://foo",
             session=session,
-            metrics=metrics,
+            metrics=pretend.stub(),
             public_keys_cache=cache,
         )
 
@@ -406,7 +398,7 @@ class TestGitHubTokenScanningPayloadVerifier:
         assert cache.cache == keys
 
     @pytest.mark.parametrize(
-        "payload, expected",
+        ("payload", "expected"),
         [
             ([], "Payload is not a dict but: []"),
             ({}, "Payload misses 'public_keys' attribute"),
@@ -553,34 +545,32 @@ class TestGitHubTokenScanningPayloadVerifier:
         assert exc.value.reason == "invalid_crypto"
 
 
-def test_analyze_disclosure(monkeypatch):
-
-    metrics = collections.Counter()
-
-    def metrics_increment(key):
-        metrics.update([key])
-
+def test_analyze_disclosure(monkeypatch, metrics):
     user_id = uuid.UUID(bytes=b"0" * 16)
-    user = pretend.stub(id=user_id)
+    user = pretend.stub(
+        id=user_id,
+        record_event=pretend.call_recorder(lambda *a, **kw: None),
+    )
     database_macaroon = pretend.stub(
         user=user,
         id=12,
         permissions_caveat={"permissions": "user", "version": 1},
+        caveats=[],
         description="foo",
     )
 
     find = pretend.call_recorder(lambda *a, **kw: database_macaroon)
     delete = pretend.call_recorder(lambda *a, **kw: None)
-    record_event = pretend.call_recorder(lambda user_id, *, tag, additional=None: None)
     svc = {
-        utils.IMetricsService: pretend.stub(increment=metrics_increment),
+        utils.IMetricsService: metrics,
         utils.IMacaroonService: pretend.stub(
             find_from_raw=find, delete_macaroon=delete
         ),
-        utils.IUserService: pretend.stub(record_event=record_event),
     }
 
-    request = pretend.stub(find_service=lambda iface, context: svc[iface])
+    request = pretend.stub(
+        find_service=lambda iface, context: svc[iface], remote_addr="0.0.0.0"
+    )
 
     send_email = pretend.call_recorder(lambda *a, **kw: None)
     monkeypatch.setattr(utils, "send_token_compromised_email_leak", send_email)
@@ -594,39 +584,34 @@ def test_analyze_disclosure(monkeypatch):
         },
         origin="github",
     )
-    assert metrics == {
-        "warehouse.token_leak.github.received": 1,
-        "warehouse.token_leak.github.processed": 1,
-        "warehouse.token_leak.github.valid": 1,
-    }
+    assert metrics.increment.calls == [
+        pretend.call("warehouse.token_leak.github.received"),
+        pretend.call("warehouse.token_leak.github.valid"),
+        pretend.call("warehouse.token_leak.github.processed"),
+    ]
     assert send_email.calls == [
         pretend.call(request, user, public_url="http://example.com", origin="github")
     ]
     assert find.calls == [pretend.call(raw_macaroon="pypi-1234")]
     assert delete.calls == [pretend.call(macaroon_id="12")]
-    assert record_event.calls == [
+    assert user.record_event.calls == [
         pretend.call(
-            user_id,
             tag=EventTag.Account.APITokenRemovedLeak,
+            request=request,
             additional={
                 "macaroon_id": "12",
                 "public_url": "http://example.com",
                 "permissions": "user",
+                "caveats": [],
                 "description": "foo",
             },
         )
     ]
 
 
-def test_analyze_disclosure_wrong_record():
-
-    metrics = collections.Counter()
-
-    def metrics_increment(key):
-        metrics.update([key])
-
+def test_analyze_disclosure_wrong_record(metrics):
     svc = {
-        utils.IMetricsService: pretend.stub(increment=metrics_increment),
+        utils.IMetricsService: metrics,
         utils.IMacaroonService: pretend.stub(),
     }
 
@@ -637,22 +622,16 @@ def test_analyze_disclosure_wrong_record():
         disclosure_record={},
         origin="github",
     )
-    assert metrics == {
-        "warehouse.token_leak.github.received": 1,
-        "warehouse.token_leak.github.error.format": 1,
-    }
+    assert metrics.increment.calls == [
+        pretend.call("warehouse.token_leak.github.received"),
+        pretend.call("warehouse.token_leak.github.error.format"),
+    ]
 
 
-def test_analyze_disclosure_invalid_macaroon():
-
-    metrics = collections.Counter()
-
-    def metrics_increment(key):
-        metrics.update([key])
-
+def test_analyze_disclosure_invalid_macaroon(metrics):
     find = pretend.raiser(utils.InvalidMacaroonError("Bla", "bla"))
     svc = {
-        utils.IMetricsService: pretend.stub(increment=metrics_increment),
+        utils.IMetricsService: metrics,
         utils.IMacaroonService: pretend.stub(find_from_raw=find),
     }
 
@@ -667,64 +646,45 @@ def test_analyze_disclosure_invalid_macaroon():
         },
         origin="github",
     )
-    assert metrics == {
-        "warehouse.token_leak.github.received": 1,
-        "warehouse.token_leak.github.error.invalid": 1,
-    }
+    assert metrics.increment.calls == [
+        pretend.call("warehouse.token_leak.github.received"),
+        pretend.call("warehouse.token_leak.github.error.invalid"),
+    ]
 
 
-def test_analyze_disclosure_unknown_error(monkeypatch):
+def test_analyze_disclosure_unknown_error(metrics, monkeypatch):
+    request = pretend.stub(find_service=lambda *a, **k: metrics)
 
-    metrics = collections.Counter()
+    class SpecificError(Exception):
+        pass
 
-    def metrics_increment(key):
-        metrics.update([key])
+    monkeypatch.setattr(utils, "_analyze_disclosure", pretend.raiser(SpecificError))
 
-    request = pretend.stub(
-        find_service=lambda *a, **k: pretend.stub(increment=metrics_increment)
-    )
-    monkeypatch.setattr(utils, "_analyze_disclosure", pretend.raiser(ValueError()))
-
-    with pytest.raises(ValueError):
+    with pytest.raises(SpecificError):
         utils.analyze_disclosure(
             request=request,
             disclosure_record={},
             origin="github",
         )
-    assert metrics == {
-        "warehouse.token_leak.github.error.unknown": 1,
-    }
+    assert metrics.increment.calls == [
+        pretend.call("warehouse.token_leak.github.error.unknown"),
+    ]
 
 
-def test_analyze_disclosures_wrong_type():
-
-    metrics = collections.Counter()
-
-    def metrics_increment(key):
-        metrics.update([key])
-
-    metrics_service = pretend.stub(increment=metrics_increment)
-
+def test_analyze_disclosures_wrong_type(metrics):
     with pytest.raises(utils.InvalidTokenLeakRequestError) as exc:
         utils.analyze_disclosures(
             request=pretend.stub(),
             disclosure_records={},
             origin="yay",
-            metrics=metrics_service,
+            metrics=metrics,
         )
 
     assert str(exc.value) == "Invalid format: payload is not a list"
     assert exc.value.reason == "format"
 
 
-def test_analyze_disclosures_raise(monkeypatch):
-    metrics = collections.Counter()
-
-    def metrics_increment(key):
-        metrics.update([key])
-
-    metrics_service = pretend.stub(increment=metrics_increment)
-
+def test_analyze_disclosures_raise(metrics, monkeypatch):
     task = pretend.stub(delay=pretend.call_recorder(lambda *a, **k: None))
     request = pretend.stub(task=lambda x: task)
 
@@ -734,7 +694,7 @@ def test_analyze_disclosures_raise(monkeypatch):
         request=request,
         disclosure_records=[1, 2, 3],
         origin="yay",
-        metrics=metrics_service,
+        metrics=metrics,
     )
 
     assert task.delay.calls == [

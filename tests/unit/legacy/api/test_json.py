@@ -16,7 +16,7 @@ import pytest
 from pyramid.httpexceptions import HTTPMovedPermanently, HTTPNotFound
 
 from warehouse.legacy.api import json
-from warehouse.packaging.models import ReleaseURL
+from warehouse.packaging.models import LifecycleStatus, ReleaseURL
 
 from ....common.db.accounts import UserFactory
 from ....common.db.integrations import VulnerabilityRecordFactory
@@ -118,6 +118,18 @@ class TestLatestReleaseFactory:
         db_request.matchdict = {"name": project.normalized_name}
         assert json.latest_release_factory(db_request) == release
 
+    def test_project_quarantined(self, monkeypatch, db_request):
+        project = ProjectFactory.create(
+            lifecycle_status=LifecycleStatus.QuarantineEnter
+        )
+        ReleaseFactory.create(project=project, version="1.0")
+
+        db_request.matchdict = {"name": project.normalized_name}
+        resp = json.latest_release_factory(db_request)
+
+        assert isinstance(resp, HTTPNotFound)
+        _assert_has_cors_headers(resp.headers)
+
 
 class TestJSONProject:
     def test_normalizing_redirects(self, db_request):
@@ -195,7 +207,6 @@ class TestJSONProject:
                 filename=f"{project.name}-{r.version}.tar.gz",
                 python_version="source",
                 size=200,
-                has_signature=True,
             )
             for r in releases[1:]
         ]
@@ -233,6 +244,7 @@ class TestJSONProject:
                 "docs_url": "/the/fake/url/",
                 "download_url": None,
                 "downloads": {"last_day": -1, "last_week": -1, "last_month": -1},
+                "dynamic": None,
                 "home_page": None,
                 "keywords": None,
                 "license": None,
@@ -243,6 +255,7 @@ class TestJSONProject:
                 "platform": None,
                 "project_url": "/the/fake/url/",
                 "project_urls": expected_urls,
+                "provides_extra": None,
                 "release_url": "/the/fake/url/",
                 "requires_dist": None,
                 "requires_python": None,
@@ -258,14 +271,14 @@ class TestJSONProject:
                         "comment_text": None,
                         "downloads": -1,
                         "filename": files[0].filename,
-                        "has_sig": True,
+                        "has_sig": False,
                         "md5_digest": files[0].md5_digest,
                         "digests": {
                             "md5": files[0].md5_digest,
                             "sha256": files[0].sha256_digest,
                             "blake2b_256": files[0].blake2_256_digest,
                         },
-                        "packagetype": None,
+                        "packagetype": files[0].packagetype,
                         "python_version": "source",
                         "size": 200,
                         "upload_time": files[0].upload_time.strftime(
@@ -283,14 +296,14 @@ class TestJSONProject:
                         "comment_text": None,
                         "downloads": -1,
                         "filename": files[1].filename,
-                        "has_sig": True,
+                        "has_sig": False,
                         "md5_digest": files[1].md5_digest,
                         "digests": {
                             "md5": files[1].md5_digest,
                             "sha256": files[1].sha256_digest,
                             "blake2b_256": files[1].blake2_256_digest,
                         },
-                        "packagetype": None,
+                        "packagetype": files[1].packagetype,
                         "python_version": "source",
                         "size": 200,
                         "upload_time": files[1].upload_time.strftime(
@@ -308,14 +321,14 @@ class TestJSONProject:
                         "comment_text": None,
                         "downloads": -1,
                         "filename": files[2].filename,
-                        "has_sig": True,
+                        "has_sig": False,
                         "md5_digest": files[2].md5_digest,
                         "digests": {
                             "blake2b_256": files[2].blake2_256_digest,
                             "md5": files[2].md5_digest,
                             "sha256": files[2].sha256_digest,
                         },
-                        "packagetype": None,
+                        "packagetype": files[2].packagetype,
                         "python_version": "source",
                         "size": 200,
                         "upload_time": files[2].upload_time.strftime(
@@ -334,14 +347,14 @@ class TestJSONProject:
                     "comment_text": None,
                     "downloads": -1,
                     "filename": files[2].filename,
-                    "has_sig": True,
+                    "has_sig": False,
                     "md5_digest": files[2].md5_digest,
                     "digests": {
                         "md5": files[2].md5_digest,
                         "sha256": files[2].sha256_digest,
                         "blake2b_256": files[2].blake2_256_digest,
                     },
-                    "packagetype": None,
+                    "packagetype": files[2].packagetype,
                     "python_version": "source",
                     "size": 200,
                     "upload_time": files[2].upload_time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -398,8 +411,20 @@ class TestReleaseFactory:
         assert isinstance(resp, HTTPNotFound)
         _assert_has_cors_headers(resp.headers)
 
+    def test_project_quarantined(self, db_request):
+        project = ProjectFactory.create(
+            lifecycle_status=LifecycleStatus.QuarantineEnter
+        )
+        ReleaseFactory.create(project=project, version="1.0")
+
+        db_request.matchdict = {"name": project.normalized_name, "version": "1.0"}
+        resp = json.release_factory(db_request)
+
+        assert isinstance(resp, HTTPNotFound)
+        _assert_has_cors_headers(resp.headers)
+
     @pytest.mark.parametrize(
-        "other_versions,the_version,lookup_version",
+        ("other_versions", "the_version", "lookup_version"),
         [
             (["0.1", "1.0", "2.0"], "3.0", "3.0"),
             (["0.1", "1.0", "2.0"], "3.0.0", "3.0"),
@@ -484,6 +509,8 @@ class TestJSONRelease:
                 description=DescriptionFactory.create(
                     content_type=description_content_type
                 ),
+                dynamic=["Platform", "Supported-Platform"],
+                provides_extra=["testing", "plugin"],
             )
         ]
 
@@ -503,7 +530,6 @@ class TestJSONRelease:
                 filename=f"{project.name}-{r.version}.tar.gz",
                 python_version="source",
                 size=200,
-                has_signature=True,
             )
             for r in releases[1:]
         ]
@@ -542,6 +568,7 @@ class TestJSONRelease:
                 "docs_url": "/the/fake/url/",
                 "download_url": None,
                 "downloads": {"last_day": -1, "last_week": -1, "last_month": -1},
+                "dynamic": ["Platform", "Supported-Platform"],
                 "home_page": None,
                 "keywords": None,
                 "license": None,
@@ -552,6 +579,7 @@ class TestJSONRelease:
                 "platform": None,
                 "project_url": "/the/fake/url/",
                 "project_urls": expected_urls,
+                "provides_extra": ["testing", "plugin"],
                 "release_url": "/the/fake/url/",
                 "requires_dist": None,
                 "requires_python": None,
@@ -565,14 +593,14 @@ class TestJSONRelease:
                     "comment_text": None,
                     "downloads": -1,
                     "filename": files[-1].filename,
-                    "has_sig": True,
+                    "has_sig": False,
                     "md5_digest": files[-1].md5_digest,
                     "digests": {
                         "md5": files[-1].md5_digest,
                         "sha256": files[-1].sha256_digest,
                         "blake2b_256": files[-1].blake2_256_digest,
                     },
-                    "packagetype": None,
+                    "packagetype": files[-1].packagetype,
                     "python_version": "source",
                     "size": 200,
                     "upload_time": files[-1].upload_time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -595,7 +623,6 @@ class TestJSONRelease:
             filename=f"{project.name}-{release.version}.tar.gz",
             python_version="source",
             size=200,
-            has_signature=True,
         )
 
         user = UserFactory.create()
@@ -633,6 +660,7 @@ class TestJSONRelease:
                 "docs_url": None,
                 "download_url": None,
                 "downloads": {"last_day": -1, "last_week": -1, "last_month": -1},
+                "dynamic": None,
                 "home_page": None,
                 "keywords": None,
                 "license": None,
@@ -643,6 +671,7 @@ class TestJSONRelease:
                 "platform": None,
                 "project_url": "/the/fake/url/",
                 "project_urls": None,
+                "provides_extra": None,
                 "release_url": "/the/fake/url/",
                 "requires_dist": None,
                 "requires_python": None,
@@ -656,14 +685,14 @@ class TestJSONRelease:
                     "comment_text": None,
                     "downloads": -1,
                     "filename": file.filename,
-                    "has_sig": True,
+                    "has_sig": False,
                     "md5_digest": file.md5_digest,
                     "digests": {
                         "md5": file.md5_digest,
                         "sha256": file.sha256_digest,
                         "blake2b_256": file.blake2_256_digest,
                     },
-                    "packagetype": None,
+                    "packagetype": file.packagetype,
                     "python_version": "source",
                     "size": 200,
                     "upload_time": file.upload_time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -678,7 +707,7 @@ class TestJSONRelease:
             "vulnerabilities": [],
         }
 
-    @pytest.mark.parametrize("withdrawn", (None, "2022-06-28T16:39:06Z"))
+    @pytest.mark.parametrize("withdrawn", [None, "2022-06-28T16:39:06Z"])
     def test_vulnerabilities_renders(self, pyramid_config, db_request, withdrawn):
         project = ProjectFactory.create(has_docs=False)
         release = ReleaseFactory.create(project=project, version="0.1")

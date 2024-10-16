@@ -21,18 +21,16 @@ import sentry_sdk
 from zope.interface import implementer
 
 from warehouse.metrics.interfaces import IMetricsService
+from warehouse.oidc.errors import InvalidPublisherError
 from warehouse.oidc.interfaces import IOIDCPublisherService, SignedClaims
 from warehouse.oidc.models import OIDCPublisher, PendingOIDCPublisher
 from warehouse.oidc.utils import find_publisher_by_issuer
-
-
-class InsecureOIDCPublisherWarning(UserWarning):
-    pass
+from warehouse.utils.exceptions import InsecureOIDCPublisherWarning
 
 
 @implementer(IOIDCPublisherService)
 class NullOIDCPublisherService:
-    def __init__(self, session, publisher, issuer_url, cache_url, metrics):
+    def __init__(self, session, publisher, issuer_url, audience, cache_url, metrics):
         warnings.warn(
             "NullOIDCPublisherService is intended only for use in development, "
             "you should not use it in production due to the lack of actual "
@@ -52,12 +50,14 @@ class NullOIDCPublisherService:
                         verify_signature=False,
                         # We require all of these to be present, but for the
                         # null publisher we only actually verify the audience.
-                        require=["iss", "iat", "nbf", "exp", "aud"],
+                        require=["iss", "iat", "exp", "aud"],
                         verify_iss=False,
                         verify_iat=False,
-                        verify_nbf=False,
                         verify_exp=False,
                         verify_aud=True,
+                        # We don't accept JWTs with multiple audiences; we
+                        # want to be the ONLY audience listed.
+                        strict_aud=True,
                     ),
                     audience="pypi",
                 )
@@ -79,13 +79,28 @@ class NullOIDCPublisherService:
         project.oidc_publishers.append(new_publisher)
         return new_publisher
 
+    def jwt_identifier_exists(self, jti: str) -> bool:
+        """
+        The NullOIDCPublisherService does not provide a mechanism to store used tokens
+        before their expiration.
+        """
+        return False
+
+    def store_jwt_identifier(self, jti: str, expiration: int) -> None:
+        """
+        The NullOIDCPublisherService does not provide a mechanism to store used tokens
+        before their expiration.
+        """
+        return
+
 
 @implementer(IOIDCPublisherService)
 class OIDCPublisherService:
-    def __init__(self, session, publisher, issuer_url, cache_url, metrics):
+    def __init__(self, session, publisher, issuer_url, audience, cache_url, metrics):
         self.db = session
         self.publisher = publisher
         self.issuer_url = issuer_url
+        self.audience = audience
         self.cache_url = cache_url
         self.metrics = metrics
 
@@ -138,7 +153,7 @@ class OIDCPublisherService:
 
         oidc_url = f"{self.issuer_url}/.well-known/openid-configuration"
 
-        resp = requests.get(oidc_url)
+        resp = requests.get(oidc_url, timeout=5)
 
         # For whatever reason, an OIDC publisher's configuration URL might be
         # offline. We don't want to completely explode here, since other
@@ -163,7 +178,7 @@ class OIDCPublisherService:
             )
             return keys
 
-        resp = requests.get(jwks_url)
+        resp = requests.get(jwks_url, timeout=5)
 
         # Same reasoning as above.
         if not resp.ok:
@@ -218,8 +233,39 @@ class OIDCPublisherService:
         unverified_header = jwt.get_unverified_header(token)
         return self._get_key(unverified_header["kid"])
 
+    def jwt_identifier_exists(self, jti: str) -> bool:
+        """
+        Check if a JWT Token Identifier has already been used.
+        """
+        with redis.StrictRedis.from_url(self.cache_url) as r:
+            return bool(r.exists(f"/warehouse/oidc/{self.publisher}/{jti}"))
+
+    def store_jwt_identifier(self, jti: str, expiration: int) -> None:
+        """
+        Store the JTI with its expiration date if the key does not exist.
+        """
+        with redis.StrictRedis.from_url(self.cache_url) as r:
+            # Defensive: to prevent races, we expire the JTI slightly after
+            # the token expiration date. Thus, the lock will not be
+            # released before the token invalidation.
+            r.set(
+                f"/warehouse/oidc/{self.publisher}/{jti}",
+                exat=expiration + 5,
+                value="",  # empty value to lower memory usage
+                nx=True,
+            )
+
     def verify_jwt_signature(self, unverified_token: str) -> SignedClaims | None:
-        key = self._get_key_for_token(unverified_token)
+        try:
+            key = self._get_key_for_token(unverified_token)
+        except jwt.PyJWTError:
+            # The user might feed us an entirely nonsense JWT, e.g. one
+            # with missing components.
+            self.metrics.increment(
+                "warehouse.oidc.verify_jwt_signature.malformed_jwt",
+                tags=[f"publisher:{self.publisher}"],
+            )
+            return None
 
         try:
             # NOTE: Many of the keyword arguments here are defaults, but we
@@ -233,15 +279,19 @@ class OIDCPublisherService:
                     # "require" only checks for the presence of these claims, not
                     # their validity. Each has a corresponding "verify_" kwarg
                     # that enforces their actual validity.
-                    require=["iss", "iat", "nbf", "exp", "aud"],
+                    require=["iss", "iat", "exp", "aud"],
                     verify_iss=True,
                     verify_iat=True,
-                    verify_nbf=True,
                     verify_exp=True,
                     verify_aud=True,
+                    # We don't require the nbf claim, but verify it if present
+                    verify_nbf=True,
+                    # We don't accept JWTs with multiple audiences; we
+                    # want to be the ONLY audience listed.
+                    strict_aud=True,
                 ),
                 issuer=self.issuer_url,
-                audience="pypi",
+                audience=self.audience,
                 leeway=30,
             )
             return SignedClaims(signed_payload)
@@ -251,46 +301,44 @@ class OIDCPublisherService:
                 tags=[f"publisher:{self.publisher}"],
             )
             if not isinstance(e, jwt.PyJWTError):
-                # We expect pyjwt to only raise subclasses of PyJWTError, but
-                # we can't enforce this. Other exceptions indicate an abstraction
-                # leak, so we log them for upstream reporting.
-                sentry_sdk.capture_message(f"JWT verify raised generic error: {e}")
+                with sentry_sdk.new_scope() as scope:
+                    scope.fingerprint = [e]
+                    # We expect pyjwt to only raise subclasses of PyJWTError, but
+                    # we can't enforce this. Other exceptions indicate an abstraction
+                    # leak, so we log them for upstream reporting.
+                    sentry_sdk.capture_message(f"JWT backend raised generic error: {e}")
             return None
 
     def find_publisher(
         self, signed_claims: SignedClaims, *, pending: bool = False
-    ) -> OIDCPublisher | PendingOIDCPublisher | None:
+    ) -> OIDCPublisher | PendingOIDCPublisher:
+        """Returns a publisher for the given claims, or raises an error."""
         metrics_tags = [f"publisher:{self.publisher}"]
         self.metrics.increment(
             "warehouse.oidc.find_publisher.attempt",
             tags=metrics_tags,
         )
 
-        publisher = find_publisher_by_issuer(
-            self.db, self.issuer_url, signed_claims, pending=pending
-        )
-        if publisher is None:
-            self.metrics.increment(
-                "warehouse.oidc.find_publisher.publisher_not_found",
-                tags=metrics_tags,
+        try:
+            publisher = find_publisher_by_issuer(
+                self.db, self.issuer_url, signed_claims, pending=pending
             )
-            return None
 
-        if not publisher.verify_claims(signed_claims):
-            self.metrics.increment(
-                "warehouse.oidc.find_publisher.invalid_claims",
-                tags=metrics_tags,
-            )
-            return None
-        else:
+            publisher.verify_claims(signed_claims, self)
             self.metrics.increment(
                 "warehouse.oidc.find_publisher.ok",
                 tags=metrics_tags,
             )
 
-        return publisher
+            return publisher
+        except InvalidPublisherError as e:
+            self.metrics.increment(
+                "warehouse.oidc.find_publisher.publisher_not_found",
+                tags=metrics_tags,
+            )
+            raise e
 
-    def reify_pending_publisher(self, pending_publisher, project):
+    def reify_pending_publisher(self, pending_publisher, project) -> OIDCPublisher:
         new_publisher = pending_publisher.reify(self.db)
         project.oidc_publishers.append(new_publisher)
         return new_publisher
@@ -304,10 +352,16 @@ class OIDCPublisherServiceFactory:
 
     def __call__(self, _context, request):
         cache_url = request.registry.settings["oidc.jwk_cache_url"]
+        audience = request.registry.settings["warehouse.oidc.audience"]
         metrics = request.find_service(IMetricsService, context=None)
 
         return self.service_class(
-            request.db, self.publisher, self.issuer_url, cache_url, metrics
+            request.db,
+            self.publisher,
+            self.issuer_url,
+            audience,
+            cache_url,
+            metrics,
         )
 
     def __eq__(self, other):

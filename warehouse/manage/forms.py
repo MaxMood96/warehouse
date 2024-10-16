@@ -37,28 +37,25 @@ from warehouse.utils.project import PROJECT_NAME_RE
 
 
 class RoleNameMixin:
-
     role_name = wtforms.SelectField(
         "Select role",
         choices=[("", "Select role"), ("Maintainer", "Maintainer"), ("Owner", "Owner")],
-        validators=[wtforms.validators.DataRequired(message="Select role")],
+        validators=[wtforms.validators.InputRequired(message="Select role")],
     )
 
 
 class TeamProjectRoleNameMixin:
-
     team_project_role_name = wtforms.SelectField(
         "Select permissions",
         choices=[("", "Select role"), ("Maintainer", "Maintainer"), ("Owner", "Owner")],
         coerce=lambda string: TeamProjectRoleType(string) if string else None,
-        validators=[wtforms.validators.DataRequired(message="Select role")],
+        validators=[wtforms.validators.InputRequired(message="Select role")],
     )
 
 
 class UsernameMixin:
-
     username = wtforms.StringField(
-        validators=[wtforms.validators.DataRequired(message="Specify username")]
+        validators=[wtforms.validators.InputRequired(message="Specify username")]
     )
 
     def validate_username(self, field):
@@ -133,7 +130,6 @@ class ChangeTeamProjectRoleForm(TeamProjectRoleNameMixin, forms.Form):
 
 
 class SaveAccountForm(forms.Form):
-
     __params__ = ["name", "public_email"]
 
     name = wtforms.StringField(
@@ -169,7 +165,6 @@ class SaveAccountForm(forms.Form):
 
 
 class AddEmailForm(NewEmailMixin, forms.Form):
-
     __params__ = ["email"]
 
     def __init__(self, *args, user_service, user_id, **kwargs):
@@ -179,7 +174,6 @@ class AddEmailForm(NewEmailMixin, forms.Form):
 
 
 class ChangePasswordForm(PasswordMixin, NewPasswordMixin, forms.Form):
-
     __params__ = ["password", "new_password", "password_confirm"]
 
     def __init__(self, *args, user_service, **kwargs):
@@ -188,7 +182,6 @@ class ChangePasswordForm(PasswordMixin, NewPasswordMixin, forms.Form):
 
 
 class ConfirmPasswordForm(UsernameMixin, PasswordMixin, forms.Form):
-
     __params__ = ["confirm_password"]
 
     def __init__(self, *args, user_service, **kwargs):
@@ -202,7 +195,6 @@ class DeleteTOTPForm(ConfirmPasswordForm):
 
 
 class ProvisionTOTPForm(TOTPValueMixin, forms.Form):
-
     __params__ = ["totp_value"]
 
     def __init__(self, *args, totp_secret, **kwargs):
@@ -211,7 +203,13 @@ class ProvisionTOTPForm(TOTPValueMixin, forms.Form):
 
     def validate_totp_value(self, field):
         totp_value = field.data.encode("utf8")
-        if not otp.verify_totp(self.totp_secret, totp_value):
+        try:
+            otp.verify_totp(self.totp_secret, totp_value)
+        except otp.OutOfSyncTOTPError:
+            raise wtforms.validators.ValidationError(
+                "Invalid TOTP code. Your device time may be out of sync."
+            )
+        except otp.InvalidTOTPError:
             raise wtforms.validators.ValidationError("Invalid TOTP code. Try again?")
 
 
@@ -220,7 +218,7 @@ class DeleteWebAuthnForm(forms.Form):
 
     label = wtforms.StringField(
         validators=[
-            wtforms.validators.DataRequired(message="Specify a device name"),
+            wtforms.validators.InputRequired(message="Specify a device name"),
             wtforms.validators.Length(
                 max=64, message=("Label must be 64 characters or less")
             ),
@@ -246,7 +244,7 @@ class ProvisionWebAuthnForm(WebAuthnCredentialMixin, forms.Form):
 
     label = wtforms.StringField(
         validators=[
-            wtforms.validators.DataRequired(message="Specify a label"),
+            wtforms.validators.InputRequired(message="Specify a label"),
             wtforms.validators.Length(
                 max=64, message=("Label must be 64 characters or less")
             ),
@@ -293,15 +291,25 @@ class ProvisionWebAuthnForm(WebAuthnCredentialMixin, forms.Form):
 class CreateMacaroonForm(forms.Form):
     __params__ = ["description", "token_scope"]
 
-    def __init__(self, *args, user_id, macaroon_service, project_names, **kwargs):
+    def __init__(
+        self,
+        *args,
+        user_id,
+        macaroon_service,
+        project_names,
+        selected_project=None,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.user_id = user_id
         self.macaroon_service = macaroon_service
         self.project_names = project_names
+        if selected_project is not None:
+            self.token_scope.data = self.scope_prefix + selected_project
 
     description = wtforms.StringField(
         validators=[
-            wtforms.validators.DataRequired(message="Specify a token name"),
+            wtforms.validators.InputRequired(message="Specify a token name"),
             wtforms.validators.Length(
                 max=100, message="Description must be 100 characters or less"
             ),
@@ -309,8 +317,10 @@ class CreateMacaroonForm(forms.Form):
     )
 
     token_scope = wtforms.StringField(
-        validators=[wtforms.validators.DataRequired(message="Specify the token scope")]
+        validators=[wtforms.validators.InputRequired(message="Specify the token scope")]
     )
+
+    scope_prefix = "scope:project:"
 
     def validate_description(self, field):
         description = field.data
@@ -355,7 +365,7 @@ class DeleteMacaroonForm(UsernameMixin, PasswordMixin, forms.Form):
     __params__ = ["confirm_password", "macaroon_id"]
 
     macaroon_id = wtforms.StringField(
-        validators=[wtforms.validators.DataRequired(message="Identifier required")]
+        validators=[wtforms.validators.InputRequired(message="Identifier required")]
     )
 
     def __init__(self, *args, macaroon_service, user_service, **kwargs):
@@ -369,17 +379,10 @@ class DeleteMacaroonForm(UsernameMixin, PasswordMixin, forms.Form):
             raise wtforms.validators.ValidationError("No such macaroon")
 
 
-class Toggle2FARequirementForm(forms.Form):
-    __params__ = ["two_factor_requirement_sentinel"]
-
-    two_factor_requirement_sentinel = wtforms.HiddenField()
-
-
 # /manage/organizations/ forms
 
 
 class OrganizationRoleNameMixin:
-
     role_name = wtforms.SelectField(
         "Select role",
         choices=[
@@ -390,15 +393,14 @@ class OrganizationRoleNameMixin:
             ("Billing Manager", "Billing Manager"),
         ],
         coerce=lambda string: OrganizationRoleType(string) if string else None,
-        validators=[wtforms.validators.DataRequired(message="Select role")],
+        validators=[wtforms.validators.InputRequired(message="Select role")],
     )
 
 
 class OrganizationNameMixin:
-
     name = wtforms.StringField(
         validators=[
-            wtforms.validators.DataRequired(
+            wtforms.validators.InputRequired(
                 message="Specify organization account name"
             ),
             wtforms.validators.Length(
@@ -423,6 +425,8 @@ class OrganizationNameMixin:
         ]
     )
 
+    organization_id = None
+
     def validate_name(self, field):
         # Find organization by name.
         organization_id = self.organization_service.find_organizationid(field.data)
@@ -438,9 +442,23 @@ class OrganizationNameMixin:
                 )
             )
 
+        outstanding_applications = (
+            self.organization_service.get_organization_applications_by_name(
+                field.data, submitted_by=self.user, undecided=True
+            )
+        )
+
+        # Name is valid if the user has no outstanding applications for the same name
+        if len(outstanding_applications) > 0:
+            raise wtforms.validators.ValidationError(
+                _(
+                    "You have already submitted an application for that name. "
+                    "Choose a different organization account name."
+                )
+            )
+
 
 class AddOrganizationProjectForm(forms.Form):
-
     __params__ = ["add_existing_project", "existing_project_name", "new_project_name"]
 
     add_existing_project = wtforms.RadioField(
@@ -492,14 +510,13 @@ class AddOrganizationProjectForm(forms.Form):
 
 
 class TransferOrganizationProjectForm(forms.Form):
-
     __params__ = ["organization"]
 
     organization = wtforms.SelectField(
         "Select organization",
         choices=[("", "Select organization")],
         validators=[
-            wtforms.validators.DataRequired(message="Select organization"),
+            wtforms.validators.InputRequired(message="Select organization"),
         ],
     )
 
@@ -537,22 +554,23 @@ class ChangeOrganizationRoleForm(OrganizationRoleNameMixin, forms.Form):
 
 
 class SaveOrganizationNameForm(OrganizationNameMixin, forms.Form):
-
     __params__ = ["name"]
 
-    def __init__(self, *args, organization_service, organization_id=None, **kwargs):
+    def __init__(
+        self, *args, organization_service, organization_id=None, user, **kwargs
+    ):
         super().__init__(*args, **kwargs)
         self.organization_service = organization_service
         self.organization_id = organization_id
+        self.user = user
 
 
 class SaveOrganizationForm(forms.Form):
-
     __params__ = ["display_name", "link_url", "description", "orgtype"]
 
     display_name = wtforms.StringField(
         validators=[
-            wtforms.validators.DataRequired(message="Specify your organization name"),
+            wtforms.validators.InputRequired(message="Specify your organization name"),
             wtforms.validators.Length(
                 max=100,
                 message=_(
@@ -564,7 +582,7 @@ class SaveOrganizationForm(forms.Form):
     )
     link_url = wtforms.URLField(
         validators=[
-            wtforms.validators.DataRequired(message="Specify your organization URL"),
+            wtforms.validators.InputRequired(message="Specify your organization URL"),
             wtforms.validators.Length(
                 max=400,
                 message=_(
@@ -580,7 +598,7 @@ class SaveOrganizationForm(forms.Form):
     )
     description = wtforms.TextAreaField(
         validators=[
-            wtforms.validators.DataRequired(
+            wtforms.validators.InputRequired(
                 message="Specify your organization description"
             ),
             wtforms.validators.Length(
@@ -596,18 +614,40 @@ class SaveOrganizationForm(forms.Form):
         choices=[("Company", "Company"), ("Community", "Community")],
         coerce=OrganizationType,
         validators=[
-            wtforms.validators.DataRequired(message="Select organization type"),
+            wtforms.validators.InputRequired(message="Select organization type"),
         ],
     )
 
 
-class CreateOrganizationForm(SaveOrganizationNameForm, SaveOrganizationForm):
+class CreateOrganizationApplicationForm(OrganizationNameMixin, SaveOrganizationForm):
+    __params__ = ["name"] + SaveOrganizationForm.__params__
 
-    __params__ = SaveOrganizationNameForm.__params__ + SaveOrganizationForm.__params__
+    _max_apps = wtforms.IntegerField()
+
+    def __init__(
+        self, *args, organization_service, user, max_applications=None, **kwargs
+    ):
+        super().__init__(*args, **kwargs)
+        self.organization_service = organization_service
+        self.user = user
+        self.max_applications = max_applications
+
+    def validate__max_apps(self, field):
+        if (
+            self.max_applications is not None
+            and len(self.user.organization_applications) >= self.max_applications
+        ):
+            self._form_errors.append(
+                _(
+                    "You have already submitted the maximum number of "
+                    f"Organization requests ({self.max_applications})."
+                )
+            )
+            return False
+        return True
 
 
 class CreateTeamRoleForm(forms.Form):
-
     username = wtforms.SelectField(
         "Select user",
         choices=[("", "Select user")],
@@ -621,12 +661,11 @@ class CreateTeamRoleForm(forms.Form):
 
 
 class SaveTeamForm(forms.Form):
-
     __params__ = ["name"]
 
     name = wtforms.StringField(
         validators=[
-            wtforms.validators.DataRequired(message="Specify team name"),
+            wtforms.validators.InputRequired(message="Specify team name"),
             wtforms.validators.Length(
                 max=50,
                 message=_("Choose a team name with 50 characters or less."),
@@ -671,5 +710,53 @@ class SaveTeamForm(forms.Form):
 
 
 class CreateTeamForm(SaveTeamForm):
-
     __params__ = SaveTeamForm.__params__
+
+
+class AddAlternateRepositoryForm(forms.Form):
+    """Form to add an Alternate Repository Location for a Project."""
+
+    __params__ = ["display_name", "link_url", "description"]
+
+    display_name = wtforms.StringField(
+        validators=[
+            wtforms.validators.InputRequired(
+                message=_("Specify your alternate repository name"),
+            ),
+            wtforms.validators.Length(
+                max=100,
+                message=_(
+                    "The name is too long. "
+                    "Choose a name with 100 characters or less."
+                ),
+            ),
+        ]
+    )
+    link_url = wtforms.URLField(
+        validators=[
+            wtforms.validators.InputRequired(
+                message=_("Specify your alternate repository URL"),
+            ),
+            wtforms.validators.Length(
+                max=400,
+                message=_(
+                    "The URL is too long. Choose a URL with 400 characters or less."
+                ),
+            ),
+            forms.URIValidator(),
+        ]
+    )
+    description = wtforms.TextAreaField(
+        validators=[
+            wtforms.validators.InputRequired(
+                message="Describe the purpose and content of the alternate repository."
+            ),
+            wtforms.validators.Length(
+                max=400,
+                message=_(
+                    "The description is too long. "
+                    "Choose a description with 400 characters or less."
+                ),
+            ),
+        ]
+    )

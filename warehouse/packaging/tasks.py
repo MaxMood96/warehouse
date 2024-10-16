@@ -11,154 +11,216 @@
 # limitations under the License.
 
 import datetime
+import logging
+import tempfile
 
+from collections import namedtuple
 from itertools import product
 
-import pip_api
-
+from celery.exceptions import SoftTimeLimitExceeded, TimeLimitExceeded
 from google.cloud.bigquery import LoadJobConfig
-from packaging.utils import canonicalize_name
+from sqlalchemy.orm import joinedload
 
 from warehouse import tasks
 from warehouse.accounts.models import User, WebAuthn
-from warehouse.email import send_two_factor_mandate_email
 from warehouse.metrics import IMetricsService
-from warehouse.packaging.models import Description, File, Project, Release, Role
+from warehouse.packaging.interfaces import IFileStorage
+from warehouse.packaging.models import Description, File, Project, Release
 from warehouse.utils import readme
+from warehouse.utils.row_counter import RowCount
+
+logger = logging.getLogger(__name__)
+
+
+def _copy_file_to_cache(archive_storage, cache_storage, path):
+    metadata = archive_storage.get_metadata(path)
+    file_obj = archive_storage.get(path)
+    with tempfile.NamedTemporaryFile() as file_for_cache:
+        file_for_cache.write(file_obj.read())
+        file_for_cache.flush()
+        cache_storage.store(path, file_for_cache.name, meta=metadata)
+
+
+@tasks.task(
+    ignore_result=True,
+    acks_late=True,
+    time_limit=120,
+    autoretry_for=(
+        SoftTimeLimitExceeded,
+        TimeLimitExceeded,
+    ),
+)
+def sync_file_to_cache(request, file_id):
+    file = request.db.get(File, file_id)
+
+    if file and not file.cached:
+        archive_storage = request.find_service(IFileStorage, name="archive")
+        cache_storage = request.find_service(IFileStorage, name="cache")
+
+        _copy_file_to_cache(archive_storage, cache_storage, file.path)
+        if file.metadata_file_sha256_digest is not None:
+            _copy_file_to_cache(archive_storage, cache_storage, file.metadata_path)
+
+        file.cached = True
 
 
 @tasks.task(ignore_result=True, acks_late=True)
-def compute_2fa_mandate(request):
-    # Get our own production dependencies
-    our_dependencies = set(
-        pip_api.parse_requirements("./requirements/main.txt")
-        | pip_api.parse_requirements("./requirements/deploy.txt")
-    )
-
-    bq = request.find_service(name="gcloud.bigquery")
-
-    # Get the top N projects in the last 6 months
-    query = bq.query(
-        """ SELECT
-              COUNT(*) AS num_downloads,
-              file.project as project_name
-            FROM
-              {table}
-            WHERE
-              DATE(timestamp) BETWEEN DATE_TRUNC(
-                DATE_SUB(CURRENT_DATE(), INTERVAL 6 MONTH), MONTH
-              )
-              AND CURRENT_DATE()
-            GROUP BY
-              file.project
-            ORDER BY
-              num_downloads DESC
-            LIMIT
-              {cohort_size}
-        """.format(
-            table=request.registry.settings["warehouse.downloads_table"],
-            cohort_size=request.registry.settings[
-                "warehouse.two_factor_mandate.cohort_size"
-            ],
+def compute_packaging_metrics(request):
+    counts = dict(
+        request.db.query(RowCount.table_name, RowCount.count)
+        .filter(
+            RowCount.table_name.in_(
+                [
+                    Project.__tablename__,
+                    Release.__tablename__,
+                    File.__tablename__,
+                ]
+            )
         )
-    )
-    top_projects = {row.get("project_name") for row in query.result()}
-
-    project_names = {canonicalize_name(n) for n in our_dependencies | top_projects}
-
-    # Get the projects that were not previously in the mandate
-    new_projects = request.db.query(Project).filter(
-        Project.normalized_name.in_(project_names), Project.pypi_mandates_2fa.is_(False)
+        .all()
     )
 
-    # Get their maintainers
-    users = (
-        request.db.query(User).join(Project.users).join(new_projects.subquery()).all()
+    metrics = request.find_service(IMetricsService, context=None)
+
+    metrics.gauge(
+        "warehouse.packaging.total_projects", counts.get(Project.__tablename__, 0)
     )
 
-    # Email them
-    for user in users:
-        send_two_factor_mandate_email(request, user)
+    metrics.gauge(
+        "warehouse.packaging.total_releases", counts.get(Release.__tablename__, 0)
+    )
 
-    # Add them to the mandate
-    new_projects.update({Project.pypi_mandates_2fa: True})
+    metrics.gauge("warehouse.packaging.total_files", counts.get(File.__tablename__, 0))
+
+
+@tasks.task(ignore_result=True, acks_late=True)
+def check_file_cache_tasks_outstanding(request):
+    metrics = request.find_service(IMetricsService, context=None)
+
+    files_not_cached = request.db.query(File).filter_by(cached=False).count()
+
+    metrics.gauge(
+        "warehouse.packaging.files.not_cached",
+        files_not_cached,
+    )
+
+
+Checksums = namedtuple("Checksums", ["file", "metadata_file"])
+
+
+def fetch_checksums(storage, file):
+    try:
+        file_checksum = storage.get_checksum(file.path)
+    except FileNotFoundError:
+        file_checksum = None
+
+    try:
+        file_metadata_checksum = storage.get_checksum(file.metadata_path)
+    except FileNotFoundError:
+        file_metadata_checksum = None
+
+    return Checksums(file_checksum, file_metadata_checksum)
+
+
+@tasks.task(ignore_results=True, acks_late=True)
+def reconcile_file_storages(request):
+    metrics = request.find_service(IMetricsService, context=None)
+    cache_storage = request.find_service(IFileStorage, name="cache")
+    archive_storage = request.find_service(IFileStorage, name="archive")
+
+    batch_size = request.registry.settings["reconcile_file_storages.batch_size"]
+
+    logger.info(f"Running reconcile_file_storages with batch_size {batch_size}...")
+
+    files_batch = request.db.query(File).filter_by(cached=False).limit(batch_size)
+
+    for file in files_batch.all():
+        logger.info(f"Checking File<{file.id}> ({file.path})...")
+        archive_checksums = fetch_checksums(archive_storage, file)
+        cache_checksums = fetch_checksums(cache_storage, file)
+
+        # Note: We don't store md5 digest for METADATA file in our database,
+        # record boolean for if we should expect values.
+        expected_checksums = Checksums(
+            file.md5_digest,
+            bool(file.metadata_file_sha256_digest),
+        )
+
+        if (
+            (archive_checksums == cache_checksums)
+            and (archive_checksums.file == expected_checksums.file)
+            and (
+                bool(archive_checksums.metadata_file)
+                == expected_checksums.metadata_file
+            )
+        ):
+            logger.info(f"    File<{file.id}> ({file.path}) is all good ✨")
+            file.cached = True
+        else:
+            errors = []
+
+            if (archive_checksums.file != cache_checksums.file) and (
+                archive_checksums.file == expected_checksums.file
+            ):
+                # No worries, a consistent file is in archive but not cache
+                _copy_file_to_cache(archive_storage, cache_storage, file.path)
+                logger.info(
+                    f"    File<{file.id}> distribution ({file.path}) "
+                    "pulled from archive ⬆️"
+                )
+                metrics.increment(
+                    "warehouse.filestorage.reconciled", tags=["type:dist"]
+                )
+            elif (
+                archive_checksums.file == cache_checksums.file
+                and archive_checksums.file is not None
+            ):
+                logger.info(f"    File<{file.id}> distribution ({file.path}) is ok ✅")
+            else:
+                metrics.increment(
+                    "warehouse.filestorage.unreconciled", tags=["type:dist"]
+                )
+                logger.error(
+                    f"Unable to reconcile stored File<{file.id}> distribution "
+                    f"({file.path}) ❌"
+                )
+                errors.append(file.path)
+
+            if expected_checksums.metadata_file and (
+                archive_checksums.metadata_file is not None
+                and cache_checksums.metadata_file is None
+            ):
+                # The only file we have is in archive, so use that for cache
+                _copy_file_to_cache(archive_storage, cache_storage, file.metadata_path)
+                logger.info(
+                    f"    File<{file.id}> METADATA ({file.metadata_path}) "
+                    "pulled from archive ⬆️"
+                )
+                metrics.increment(
+                    "warehouse.filestorage.reconciled", tags=["type:metadata"]
+                )
+            elif expected_checksums.metadata_file:
+                if archive_checksums.metadata_file == cache_checksums.metadata_file:
+                    logger.info(
+                        f"    File<{file.id}> METADATA ({file.metadata_path}) is ok ✅"
+                    )
+                else:
+                    metrics.increment(
+                        "warehouse.filestorage.unreconciled", tags=["type:metadata"]
+                    )
+                    logger.error(
+                        f"Unable to reconcile stored File<{file.id}> METADATA "
+                        f"({file.metadata_path}) ❌"
+                    )
+                    errors.append(file.metadata_path)
+
+            if len(errors) == 0:
+                file.cached = True
 
 
 @tasks.task(ignore_result=True, acks_late=True)
 def compute_2fa_metrics(request):
     metrics = request.find_service(IMetricsService, context=None)
-
-    critical_projects = request.db.query(Project).where(
-        Project.pypi_mandates_2fa.is_(True)
-    )
-    critical_maintainers = (
-        request.db.query(User).join(Project.users).join(critical_projects.subquery())
-    )
-
-    # Number of projects marked critical
-    metrics.gauge(
-        "warehouse.2fa.total_critical_projects",
-        critical_projects.count(),
-    )
-
-    # Number of critical project maintainers
-    metrics.gauge(
-        "warehouse.2fa.total_critical_maintainers",
-        critical_maintainers.count(),
-    )
-
-    # Number of critical project maintainers with TOTP enabled
-    total_critical_project_maintainers_with_totp_enabled = (
-        request.db.query(User.id)
-        .distinct()
-        .join(Role, Role.user_id == User.id)
-        .join(Project, Project.id == Role.project_id)
-        .where(Project.pypi_mandates_2fa)
-        .where(User.totp_secret.is_not(None))
-        .count()
-    )
-    metrics.gauge(
-        "warehouse.2fa.total_critical_maintainers_with_totp_enabled",
-        total_critical_project_maintainers_with_totp_enabled,
-    )
-
-    # Number of critical project maintainers with WebAuthn enabled
-    metrics.gauge(
-        "warehouse.2fa.total_critical_maintainers_with_webauthn_enabled",
-        request.db.query(User.id)
-        .distinct()
-        .join(Role.user)
-        .join(Role.project)
-        .join(WebAuthn, WebAuthn.user_id == User.id)
-        .where(Project.pypi_mandates_2fa)
-        .count(),
-    )
-
-    # Number of critical project maintainers with 2FA enabled
-    metrics.gauge(
-        "warehouse.2fa.total_critical_maintainers_with_2fa_enabled",
-        total_critical_project_maintainers_with_totp_enabled
-        + request.db.query(User.id)
-        .distinct()
-        .join(Role.user)
-        .join(Role.project)
-        .join(WebAuthn, WebAuthn.user_id == User.id)
-        .where(Project.pypi_mandates_2fa)
-        .where(User.totp_secret.is_(None))
-        .count(),
-    )
-
-    # Number of projects manually requiring 2FA
-    metrics.gauge(
-        "warehouse.2fa.total_projects_with_2fa_opt_in",
-        request.db.query(Project).where(Project.owners_require_2fa).count(),
-    )
-
-    # Total number of projects requiring 2FA
-    metrics.gauge(
-        "warehouse.2fa.total_projects_with_two_factor_required",
-        request.db.query(Project).where(Project.two_factor_required).count(),
-    )
 
     # Total number of users with TOTP enabled
     total_users_with_totp_enabled = (
@@ -204,6 +266,24 @@ def update_description_html(request):
     for description in descriptions:
         description.html = readme.render(description.raw, description.content_type)
         description.rendered_by = renderer_version
+
+
+@tasks.task(bind=True, ignore_result=True, acks_late=True)
+def update_release_description(_task, request, release_id):
+    """Given a release_id, update the release description via readme-renderer."""
+    renderer_version = readme.renderer_version()
+
+    release = (
+        request.db.query(Release)
+        .filter(Release.id == release_id)
+        .options(joinedload(Release.description))
+        .first()
+    )
+
+    release.description.html = readme.render(
+        release.description.raw, release.description.content_type
+    )
+    release.description.rendered_by = renderer_version
 
 
 @tasks.task(
@@ -327,6 +407,7 @@ def sync_bigquery_release_files(request):
                         row_data[sch.name] = list(field_data)
                 else:
                     row_data[sch.name] = field_data
+            row_data["has_signature"] = False
             return row_data
 
         for first, second in product("fedcba9876543210", repeat=2):

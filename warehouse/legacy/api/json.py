@@ -18,26 +18,15 @@ from sqlalchemy.orm import Load, contains_eager, joinedload
 
 from warehouse.cache.http import cache_control
 from warehouse.cache.origin import origin_cache
-from warehouse.packaging.models import File, Project, Release, ReleaseURL
-
-# Generate appropriate CORS headers for the JSON endpoint.
-# We want to allow Cross-Origin requests here so that users can interact
-# with these endpoints via XHR/Fetch APIs in the browser.
-_CORS_HEADERS = {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Headers": ", ".join(
-        [
-            "Content-Type",
-            "If-Match",
-            "If-Modified-Since",
-            "If-None-Match",
-            "If-Unmodified-Since",
-        ]
-    ),
-    "Access-Control-Allow-Methods": "GET",
-    "Access-Control-Max-Age": "86400",  # 1 day.
-    "Access-Control-Expose-Headers": ", ".join(["X-PyPI-Last-Serial"]),
-}
+from warehouse.packaging.models import (
+    Description,
+    File,
+    LifecycleStatus,
+    Project,
+    Release,
+    ReleaseURL,
+)
+from warehouse.utils.cors import _CORS_HEADERS
 
 _RELEASE_CACHE_DECORATOR = [
     cache_control(15 * 60),  # 15 minutes
@@ -66,7 +55,10 @@ def _json_data(request, project, release, *, all_releases):
         request.db.query(Release, File)
         .options(
             Load(Release).load_only(
-                "version", "requires_python", "yanked", "yanked_reason"
+                Release.version,
+                Release.requires_python,
+                Release.yanked,
+                Release.yanked_reason,
             )
         )
         .outerjoin(File)
@@ -77,6 +69,14 @@ def _json_data(request, project, release, *, all_releases):
     # to just this release.
     if not all_releases:
         release_files = release_files.filter(Release.id == release.id)
+
+    # Get the raw description and description content type for this release
+    release_description = (
+        request.db.query(Description)
+        .options(Load(Description).load_only(Description.content_type, Description.raw))
+        .filter(Description.release == release)
+        .one()
+    )
 
     # Finally set an ordering, and execute the query.
     release_files = release_files.order_by(
@@ -99,7 +99,9 @@ def _json_data(request, project, release, *, all_releases):
                 "filename": f.filename,
                 "packagetype": f.packagetype,
                 "python_version": f.python_version,
-                "has_sig": f.has_signature,
+                # TODO: Remove this once we've had a long enough time with it
+                #       here to consider it no longer in use.
+                "has_sig": False,
                 "comment_text": f.comment_text,
                 "md5_digest": f.md5_digest,
                 "digests": {
@@ -147,8 +149,8 @@ def _json_data(request, project, release, *, all_releases):
             "name": project.name,
             "version": release.version,
             "summary": release.summary,
-            "description_content_type": release.description.content_type,
-            "description": release.description.raw,
+            "description_content_type": release_description.content_type,
+            "description": release_description.raw,
             "keywords": release.keywords,
             "license": release.license,
             "classifiers": list(release.classifiers),
@@ -168,12 +170,16 @@ def _json_data(request, project, release, *, all_releases):
             "requires_dist": (
                 list(release.requires_dist) if release.requires_dist else None
             ),
+            "provides_extra": (
+                list(release.provides_extra) if release.provides_extra else None
+            ),
             "docs_url": project.documentation_url,
             "bugtrack_url": None,
             "home_page": release.home_page,
             "download_url": release.download_url,
             "yanked": release.yanked,
             "yanked_reason": release.yanked_reason or None,
+            "dynamic": list(release.dynamic) if release.dynamic else None,
         },
         "urls": releases[release.version],
         "vulnerabilities": vulnerabilities,
@@ -194,6 +200,12 @@ def latest_release_factory(request):
             request.db.query(Release.id, Release.version)
             .join(Release.project)
             .filter(Project.normalized_name == normalized_name)
+            # Exclude projects in quarantine.
+            .filter(
+                Project.lifecycle_status.is_distinct_from(
+                    LifecycleStatus.QuarantineEnter
+                )
+            )
             .order_by(
                 Release.yanked.asc(),
                 Release.is_prerelease.nullslast(),
@@ -273,6 +285,10 @@ def release_factory(request):
             joinedload(Release._requires_dist),
         )
         .filter(Project.normalized_name == normalized_name)
+        # Exclude projects in quarantine.
+        .filter(
+            Project.lifecycle_status.is_distinct_from(LifecycleStatus.QuarantineEnter)
+        )
     )
 
     try:
