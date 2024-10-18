@@ -11,7 +11,7 @@
 # limitations under the License.
 
 from wtforms import Form as BaseForm, StringField
-from wtforms.validators import DataRequired, StopValidation, ValidationError
+from wtforms.validators import InputRequired, StopValidation, ValidationError
 from zxcvbn import zxcvbn
 
 from warehouse.i18n import KNOWN_LOCALES
@@ -40,7 +40,6 @@ class URIValidator:
 
 
 class PasswordStrengthValidator:
-
     # From the zxcvbn documentation, a score of 2 is:
     #       somewhat guessable: protection from unthrottled online attacks.
     #       (guesses < 10^8)
@@ -116,16 +115,10 @@ class Form(BaseForm):
         return errors
 
 
-class DBForm(Form):
-    def __init__(self, *args, db, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.db = db
-
-
 class SetLocaleForm(Form):
     __params__ = ["locale_id"]
 
-    locale_id = StringField(validators=[DataRequired(message="Missing locale ID")])
+    locale_id = StringField(validators=[InputRequired(message="Missing locale ID")])
 
     def validate_locale_id(self, field):
         if field.data not in KNOWN_LOCALES.keys():

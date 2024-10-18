@@ -56,8 +56,15 @@ def includeme(config):
     )
 
     # Our legal policies
-    config.add_policy("terms-of-use", "terms.md")
-    config.add_policy("acceptable-use-policy", "acceptable-use-policy.md")
+    _domain_prefix = rf"https?://({warehouse}|localhost)"
+    config.add_redirect_rule(
+        f"{_domain_prefix}/policy/terms-of-use/",
+        "https://policies.python.org/pypi.org/Terms-of-Use/",
+    )
+    config.add_redirect_rule(
+        f"{_domain_prefix}/policy/acceptable-use-policy/",
+        "https://policies.python.org/pypi.org/Acceptable-Use-Policy/",
+    )
     config.add_template_view(
         "trademarks",
         "/trademarks/",
@@ -124,6 +131,13 @@ def includeme(config):
         traverse="/{user_name}",
         domain=warehouse,
     )
+    config.add_route(
+        "includes.submit_malware_report",
+        "/_includes/submit-malware-report/{project_name}",
+        factory="warehouse.packaging.models:ProjectFactory",
+        traverse="/{project_name}",
+        domain=warehouse,
+    )
 
     # Classifier Routes
     config.add_route("classifiers", "/classifiers/", domain=warehouse)
@@ -149,6 +163,14 @@ def includeme(config):
         "/user/{username}/",
         factory="warehouse.accounts.models:UserFactory",
         traverse="/{username}",
+        domain=warehouse,
+    )
+    config.add_route("accounts.search", "/accounts/search/", domain=warehouse)
+    config.add_route(
+        "organizations.profile",
+        "/org/{organization}/",
+        factory="warehouse.organizations.models:OrganizationFactory",
+        traverse="/{organization}",
         domain=warehouse,
     )
     config.add_route("accounts.login", "/account/login/", domain=warehouse)
@@ -194,6 +216,9 @@ def includeme(config):
     )
 
     # Management (views for logged-in users)
+    config.add_route(
+        "manage.unverified-account", "/manage/unverified-account/", domain=warehouse
+    )
     config.add_route("manage.account", "/manage/account/", domain=warehouse)
     config.add_route(
         "manage.account.publishing", "/manage/account/publishing/", domain=warehouse
@@ -294,6 +319,13 @@ def includeme(config):
     config.add_route(
         "manage.organization.revoke_invite",
         "/manage/organization/{organization_name}/people/revoke_invite/",
+        factory="warehouse.organizations.models:OrganizationFactory",
+        traverse="/{organization_name}",
+        domain=warehouse,
+    )
+    config.add_route(
+        "manage.organization.resend_invite",
+        "/manage/organization/{organization_name}/people/resend_invite/",
         factory="warehouse.organizations.models:OrganizationFactory",
         traverse="/{organization_name}",
         domain=warehouse,
@@ -478,6 +510,13 @@ def includeme(config):
         domain=warehouse,
     )
     config.add_route(
+        "packaging.project.submit_malware_observation",
+        "/project/{name}/submit-malware-report/",
+        factory="warehouse.packaging.models:ProjectFactory",
+        traverse="/{name}",
+        domain=warehouse,
+    )
+    config.add_route(
         "packaging.release",
         "/project/{name}/{version}/",
         factory="warehouse.packaging.models:ProjectFactory",
@@ -521,6 +560,28 @@ def includeme(config):
         "/simple/{name}/",
         factory="warehouse.packaging.models:ProjectFactory",
         traverse="/{name}/",
+        domain=warehouse,
+    )
+
+    config.add_route(
+        "api.echo",
+        "/danger-api/echo",
+        domain=warehouse,
+    )
+    config.add_route(
+        "api.projects.observations",
+        "/danger-api/projects/{name}/observations",
+        factory="warehouse.packaging.models:ProjectFactory",
+        traverse="/{name}",
+        domain=warehouse,
+    )
+
+    # PEP 740 URLs
+    config.add_route(
+        "integrity.provenance",
+        "/integrity/{project_name}/{release}/{filename}/provenance",
+        factory="warehouse.packaging.models:ProjectFactory",
+        traverse="/{project_name}/{release}/{filename}",
         domain=warehouse,
     )
 

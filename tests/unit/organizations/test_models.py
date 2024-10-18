@@ -17,6 +17,7 @@ from pyramid.authorization import Allow
 from pyramid.httpexceptions import HTTPPermanentRedirect
 from pyramid.location import lineage
 
+from warehouse.authnz import Permissions
 from warehouse.organizations.models import (
     OrganizationFactory,
     OrganizationRoleType,
@@ -66,6 +67,19 @@ class TestOrganizationFactory:
 
 
 class TestOrganization:
+    def test_customer_name(self, db_session):
+        organization = DBOrganizationFactory.create(
+            name="pypi", display_name="The Python Package Index"
+        )
+        assert (
+            organization.customer_name()
+            == "PyPI Organization - The Python Package Index (pypi)"
+        )
+        assert (
+            organization.customer_name("Test PyPI")
+            == "Test PyPI Organization - The Python Package Index (pypi)"
+        )
+
     def test_acl(self, db_session):
         organization = DBOrganizationFactory.create()
         owner1 = DBOrganizationRoleFactory.create(organization=organization)
@@ -102,34 +116,41 @@ class TestOrganization:
             acls.extend(acl)
 
         assert acls == [
-            (Allow, "group:admins", "admin"),
-            (Allow, "group:moderators", "moderator"),
+            (
+                Allow,
+                "group:admins",
+                (
+                    Permissions.AdminOrganizationsRead,
+                    Permissions.AdminOrganizationsWrite,
+                ),
+            ),
+            (Allow, "group:moderators", Permissions.AdminOrganizationsRead),
         ] + sorted(
             [
                 (
                     Allow,
                     f"user:{owner1.user.id}",
                     [
-                        "view:organization",
-                        "view:team",
-                        "manage:organization",
-                        "manage:team",
-                        "manage:billing",
-                        "add:project",
-                        "remove:project",
+                        Permissions.OrganizationsRead,
+                        Permissions.OrganizationTeamsRead,
+                        Permissions.OrganizationsManage,
+                        Permissions.OrganizationTeamsManage,
+                        Permissions.OrganizationsBillingManage,
+                        Permissions.OrganizationProjectsAdd,
+                        Permissions.OrganizationProjectsRemove,
                     ],
                 ),
                 (
                     Allow,
                     f"user:{owner2.user.id}",
                     [
-                        "view:organization",
-                        "view:team",
-                        "manage:organization",
-                        "manage:team",
-                        "manage:billing",
-                        "add:project",
-                        "remove:project",
+                        Permissions.OrganizationsRead,
+                        Permissions.OrganizationTeamsRead,
+                        Permissions.OrganizationsManage,
+                        Permissions.OrganizationTeamsManage,
+                        Permissions.OrganizationsBillingManage,
+                        Permissions.OrganizationProjectsAdd,
+                        Permissions.OrganizationProjectsRemove,
                     ],
                 ),
             ],
@@ -139,12 +160,20 @@ class TestOrganization:
                 (
                     Allow,
                     f"user:{billing_mgr1.user.id}",
-                    ["view:organization", "view:team", "manage:billing"],
+                    [
+                        Permissions.OrganizationsRead,
+                        Permissions.OrganizationTeamsRead,
+                        Permissions.OrganizationsBillingManage,
+                    ],
                 ),
                 (
                     Allow,
                     f"user:{billing_mgr2.user.id}",
-                    ["view:organization", "view:team", "manage:billing"],
+                    [
+                        Permissions.OrganizationsRead,
+                        Permissions.OrganizationTeamsRead,
+                        Permissions.OrganizationsBillingManage,
+                    ],
                 ),
             ],
             key=lambda x: x[1],
@@ -153,22 +182,98 @@ class TestOrganization:
                 (
                     Allow,
                     f"user:{account_mgr1.user.id}",
-                    ["view:organization", "view:team", "manage:team", "add:project"],
+                    [
+                        Permissions.OrganizationsRead,
+                        Permissions.OrganizationTeamsRead,
+                        Permissions.OrganizationTeamsManage,
+                        Permissions.OrganizationProjectsAdd,
+                    ],
                 ),
                 (
                     Allow,
                     f"user:{account_mgr2.user.id}",
-                    ["view:organization", "view:team", "manage:team", "add:project"],
+                    [
+                        Permissions.OrganizationsRead,
+                        Permissions.OrganizationTeamsRead,
+                        Permissions.OrganizationTeamsManage,
+                        Permissions.OrganizationProjectsAdd,
+                    ],
                 ),
             ],
             key=lambda x: x[1],
         ) + sorted(
             [
-                (Allow, f"user:{member1.user.id}", ["view:organization", "view:team"]),
-                (Allow, f"user:{member2.user.id}", ["view:organization", "view:team"]),
+                (
+                    Allow,
+                    f"user:{member1.user.id}",
+                    [Permissions.OrganizationsRead, Permissions.OrganizationTeamsRead],
+                ),
+                (
+                    Allow,
+                    f"user:{member2.user.id}",
+                    [Permissions.OrganizationsRead, Permissions.OrganizationTeamsRead],
+                ),
             ],
             key=lambda x: x[1],
         )
+
+    def test_record_event_with_geoip(self, db_request):
+        """
+        Test to cover condition when record_event is called with geoip_info as
+        part of the inbound request.
+        Possibly could be removed once more comprehensive tests are in place,
+        but nothing explicitly covers `HasEvents.record_event`
+        """
+        db_request.ip_address.geoip_info = {"country_name": "United States"}
+
+        organization = DBOrganizationFactory.create()
+
+        organization.record_event(
+            tag="",
+            request=db_request,
+            additional={},
+        )
+
+        event = organization.events[0]
+
+        assert event.additional == {
+            "organization_name": organization.name,
+            "geoip_info": {"country_name": "United States"},
+        }
+        assert event.location_info == "United States"
+
+    def test_location_info_without_geoip(self, db_request):
+        organization = DBOrganizationFactory.create()
+        organization.record_event(
+            tag="",
+            request=db_request,
+            additional={},
+        )
+
+        event = organization.events[0]
+
+        assert event.additional == {
+            "organization_name": organization.name,
+        }
+        assert event.location_info == db_request.ip_address
+
+    def test_location_info_with_partial(self, db_request):
+        db_request.ip_address.geoip_info = {"country_code3": "USA"}
+
+        organization = DBOrganizationFactory.create()
+        organization.record_event(
+            tag="",
+            request=db_request,
+            additional={},
+        )
+
+        event = organization.events[0]
+
+        assert event.additional == {
+            "organization_name": organization.name,
+            "geoip_info": {"country_code3": "USA"},
+        }
+        assert event.location_info == db_request.ip_address
 
 
 class TestTeamFactory:
@@ -228,34 +333,41 @@ class TestTeam:
             acls.extend(acl)
 
         assert acls == [
-            (Allow, "group:admins", "admin"),
-            (Allow, "group:moderators", "moderator"),
+            (
+                Allow,
+                "group:admins",
+                (
+                    Permissions.AdminOrganizationsRead,
+                    Permissions.AdminOrganizationsWrite,
+                ),
+            ),
+            (Allow, "group:moderators", Permissions.AdminOrganizationsRead),
         ] + sorted(
             [
                 (
                     Allow,
                     f"user:{owner1.user.id}",
                     [
-                        "view:organization",
-                        "view:team",
-                        "manage:organization",
-                        "manage:team",
-                        "manage:billing",
-                        "add:project",
-                        "remove:project",
+                        Permissions.OrganizationsRead,
+                        Permissions.OrganizationTeamsRead,
+                        Permissions.OrganizationsManage,
+                        Permissions.OrganizationTeamsManage,
+                        Permissions.OrganizationsBillingManage,
+                        Permissions.OrganizationProjectsAdd,
+                        Permissions.OrganizationProjectsRemove,
                     ],
                 ),
                 (
                     Allow,
                     f"user:{owner2.user.id}",
                     [
-                        "view:organization",
-                        "view:team",
-                        "manage:organization",
-                        "manage:team",
-                        "manage:billing",
-                        "add:project",
-                        "remove:project",
+                        Permissions.OrganizationsRead,
+                        Permissions.OrganizationTeamsRead,
+                        Permissions.OrganizationsManage,
+                        Permissions.OrganizationTeamsManage,
+                        Permissions.OrganizationsBillingManage,
+                        Permissions.OrganizationProjectsAdd,
+                        Permissions.OrganizationProjectsRemove,
                     ],
                 ),
             ],
@@ -265,12 +377,20 @@ class TestTeam:
                 (
                     Allow,
                     f"user:{billing_mgr1.user.id}",
-                    ["view:organization", "view:team", "manage:billing"],
+                    [
+                        Permissions.OrganizationsRead,
+                        Permissions.OrganizationTeamsRead,
+                        Permissions.OrganizationsBillingManage,
+                    ],
                 ),
                 (
                     Allow,
                     f"user:{billing_mgr2.user.id}",
-                    ["view:organization", "view:team", "manage:billing"],
+                    [
+                        Permissions.OrganizationsRead,
+                        Permissions.OrganizationTeamsRead,
+                        Permissions.OrganizationsBillingManage,
+                    ],
                 ),
             ],
             key=lambda x: x[1],
@@ -279,19 +399,37 @@ class TestTeam:
                 (
                     Allow,
                     f"user:{account_mgr1.user.id}",
-                    ["view:organization", "view:team", "manage:team", "add:project"],
+                    [
+                        Permissions.OrganizationsRead,
+                        Permissions.OrganizationTeamsRead,
+                        Permissions.OrganizationTeamsManage,
+                        Permissions.OrganizationProjectsAdd,
+                    ],
                 ),
                 (
                     Allow,
                     f"user:{account_mgr2.user.id}",
-                    ["view:organization", "view:team", "manage:team", "add:project"],
+                    [
+                        Permissions.OrganizationsRead,
+                        Permissions.OrganizationTeamsRead,
+                        Permissions.OrganizationTeamsManage,
+                        Permissions.OrganizationProjectsAdd,
+                    ],
                 ),
             ],
             key=lambda x: x[1],
         ) + sorted(
             [
-                (Allow, f"user:{member1.user.id}", ["view:organization", "view:team"]),
-                (Allow, f"user:{member2.user.id}", ["view:organization", "view:team"]),
+                (
+                    Allow,
+                    f"user:{member1.user.id}",
+                    [Permissions.OrganizationsRead, Permissions.OrganizationTeamsRead],
+                ),
+                (
+                    Allow,
+                    f"user:{member2.user.id}",
+                    [Permissions.OrganizationsRead, Permissions.OrganizationTeamsRead],
+                ),
             ],
             key=lambda x: x[1],
         )

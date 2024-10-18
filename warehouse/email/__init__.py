@@ -16,9 +16,11 @@ import functools
 from email.headerregistry import Address
 
 import pytz
+import sentry_sdk
 
 from celery.schedules import crontab
 from first import first
+from pyramid_mailer.exceptions import BadHeaders, EncodingError, InvalidMessage
 from sqlalchemy.exc import NoResultFound
 
 from warehouse import tasks
@@ -27,6 +29,8 @@ from warehouse.accounts.models import Email
 from warehouse.email.interfaces import IEmailSender
 from warehouse.email.services import EmailMessage
 from warehouse.email.ses.tasks import cleanup as ses_cleanup
+from warehouse.events.tags import EventTag
+from warehouse.metrics.interfaces import IMetricsService
 
 
 def _compute_recipient(user, email):
@@ -64,10 +68,16 @@ def send_email(task, request, recipient, msg, success_event):
 
     try:
         sender.send(recipient, msg)
-
         user_service = request.find_service(IUserService, context=None)
-        user_service.record_event(**success_event)
+        user = user_service.get_user(success_event.pop("user_id"))
+        success_event["request"] = request
+        if user is not None:  # We send account deletion confirmation emails
+            user.record_event(**success_event)
+    except (BadHeaders, EncodingError, InvalidMessage) as exc:
+        raise exc
     except Exception as exc:
+        # Send any other exception to Sentry, but don't re-raise it
+        sentry_sdk.capture_exception(exc)
         task.retry(exc=exc)
 
 
@@ -79,6 +89,7 @@ def _send_email_to_user(
     email=None,
     allow_unverified=False,
     repeat_window=None,
+    override_from=None,
 ):
     # If we were not given a specific email object, then we'll default to using
     # the User's primary email address.
@@ -105,12 +116,17 @@ def _send_email_to_user(
             "subject": msg.subject,
             "body_text": msg.body_text,
             "body_html": msg.body_html,
+            "sender": override_from,
         },
         {
-            "tag": "account:email:sent",
+            "tag": EventTag.Account.EmailSent,
             "user_id": user.id,
             "additional": {
-                "from_": request.registry.settings.get("mail.sender"),
+                "from_": (
+                    request.registry.settings.get("mail.sender")
+                    if override_from is None
+                    else override_from
+                ),
                 "to": email.email,
                 "subject": msg.subject,
                 "redact_ip": _redact_ip(request, email.email),
@@ -124,6 +140,7 @@ def _email(
     *,
     allow_unverified=False,
     repeat_window=None,
+    override_from=None,
 ):
     """
     This decorator is used to turn an e function into an email sending function!
@@ -180,6 +197,20 @@ def _email(
                     email=email,
                     allow_unverified=allow_unverified,
                     repeat_window=repeat_window,
+                    override_from=override_from,
+                )
+                metrics = request.find_service(IMetricsService, context=None)
+                metrics.increment(
+                    "warehouse.emails.scheduled",
+                    tags=[
+                        f"template_name:{name}",
+                        f"allow_unverified:{allow_unverified}",
+                        (
+                            f"repeat_window:{repeat_window.total_seconds()}"
+                            if repeat_window
+                            else "repeat_window:none"
+                        ),
+                    ],
                 )
 
             return context
@@ -253,11 +284,11 @@ def send_password_reset_email(request, user_and_email):
         {
             "action": "password-reset",
             "user.id": str(user.id),
-            "user.last_login": str(user.last_login),
+            "user.last_login": str(
+                user.last_login or datetime.datetime.min.replace(tzinfo=pytz.UTC)
+            ),
             "user.password_date": str(
-                user.password_date
-                if user.password_date is not None
-                else datetime.datetime.min.replace(tzinfo=pytz.UTC)
+                user.password_date or datetime.datetime.min.replace(tzinfo=pytz.UTC)
             ),
         }
     )
@@ -282,6 +313,16 @@ def send_email_verification_email(request, user_and_email):
     }
 
 
+@_email("new-email-added")
+def send_new_email_added_email(request, user_and_email, *, new_email_address):
+    user, _ = user_and_email
+
+    return {
+        "username": user.username,
+        "new_email_address": new_email_address,
+    }
+
+
 @_email("password-change")
 def send_password_change_email(request, user):
     return {"username": user.username}
@@ -297,18 +338,31 @@ def send_password_compromised_email_hibp(request, user):
     return {}
 
 
+@_email("password-reset-by-admin", allow_unverified=True)
+def send_password_reset_by_admin_email(request, user):
+    return {}
+
+
 @_email("token-compromised-leak", allow_unverified=True)
 def send_token_compromised_email_leak(request, user, *, public_url, origin):
     return {"username": user.username, "public_url": public_url, "origin": origin}
 
 
 @_email(
-    "basic-auth-with-2fa",
+    "account-recovery-initiated",
     allow_unverified=True,
-    repeat_window=datetime.timedelta(days=1),
+    override_from="support@pypi.org",
 )
-def send_basic_auth_with_two_factor_email(request, user, *, project_name):
-    return {"project_name": project_name}
+def send_account_recovery_initiated_email(
+    request, user_and_email, *, project_name, support_issue_link, token
+):
+    user, email = user_and_email
+    return {
+        "user": user,
+        "support_issue_link": support_issue_link,
+        "project_name": project_name,
+        "token": token,
+    }
 
 
 @_email("account-deleted")
@@ -971,38 +1025,42 @@ def send_recovery_code_reminder_email(request, user):
     return {"username": user.username}
 
 
-@_email("oidc-publisher-added")
-def send_oidc_publisher_added_email(request, user, project_name, publisher):
+@_email("trusted-publisher-added")
+def send_trusted_publisher_added_email(request, user, project_name, publisher):
     # We use the request's user, since they're the one triggering the action.
     return {
         "username": request.user.username,
         "project_name": project_name,
-        "publisher_name": publisher.publisher_name,
-        "publisher_spec": str(publisher),
+        "publisher": publisher,
     }
 
 
-@_email("oidc-publisher-removed")
-def send_oidc_publisher_removed_email(request, user, project_name, publisher):
+@_email("trusted-publisher-removed")
+def send_trusted_publisher_removed_email(request, user, project_name, publisher):
     # We use the request's user, since they're the one triggering the action.
     return {
         "username": request.user.username,
         "project_name": project_name,
-        "publisher_name": publisher.publisher_name,
-        "publisher_spec": str(publisher),
+        "publisher": publisher,
     }
 
 
-@_email("pending-oidc-publisher-invalidated")
-def send_pending_oidc_publisher_invalidated_email(request, user, project_name):
+@_email("pending-trusted-publisher-invalidated")
+def send_pending_trusted_publisher_invalidated_email(request, user, project_name):
     return {
         "project_name": project_name,
     }
 
 
-@_email("two-factor-mandate")
-def send_two_factor_mandate_email(request, user):
-    return {"username": user.username, "has_two_factor": user.has_two_factor}
+@_email("api-token-used-in-trusted-publisher-project")
+def send_api_token_used_in_trusted_publisher_project_email(
+    request, users, project_name, token_owner_username, token_name
+):
+    return {
+        "token_owner_username": token_owner_username,
+        "project_name": project_name,
+        "token_name": token_name,
+    }
 
 
 def includeme(config):

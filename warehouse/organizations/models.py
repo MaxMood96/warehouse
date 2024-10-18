@@ -9,37 +9,50 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
 
+import datetime
 import enum
+import typing
+
+from uuid import UUID
 
 from pyramid.authorization import Allow
 from pyramid.httpexceptions import HTTPPermanentRedirect
 from sqlalchemy import (
-    Boolean,
     CheckConstraint,
-    Column,
-    DateTime,
     Enum,
     ForeignKey,
     Index,
-    Text,
     UniqueConstraint,
     func,
     orm,
-    sql,
 )
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.exc import NoResultFound
-from sqlalchemy_utils.types.url import URLType
+from sqlalchemy.orm import (
+    Mapped,
+    column_property,
+    declared_attr,
+    mapped_column,
+    relationship,
+)
 
 from warehouse import db
 from warehouse.accounts.models import User
+from warehouse.authnz import Permissions
 from warehouse.events.models import HasEvents
 from warehouse.utils.attrs import make_repr
+from warehouse.utils.db.types import bool_false, datetime_now
+
+if typing.TYPE_CHECKING:
+    from pyramid.request import Request
+
+    from warehouse.packaging.models import Project
+    from warehouse.subscriptions.models import StripeCustomer, StripeSubscription
 
 
 class OrganizationRoleType(str, enum.Enum):
-
     Owner = "Owner"
     BillingManager = "Billing Manager"
     Manager = "Manager"
@@ -47,7 +60,6 @@ class OrganizationRoleType(str, enum.Enum):
 
 
 class OrganizationRole(db.Model):
-
     __tablename__ = "organization_roles"
     __table_args__ = (
         Index("organization_roles_user_id_idx", "user_id"),
@@ -61,24 +73,23 @@ class OrganizationRole(db.Model):
 
     __repr__ = make_repr("role_name")
 
-    role_name = Column(
+    role_name: Mapped[OrganizationRoleType] = mapped_column(
         Enum(OrganizationRoleType, values_callable=lambda x: [e.value for e in x]),
-        nullable=False,
     )
-    user_id = Column(
-        ForeignKey("users.id", onupdate="CASCADE", ondelete="CASCADE"), nullable=False
+    user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("users.id", onupdate="CASCADE", ondelete="CASCADE"),
     )
-    organization_id = Column(
+    organization_id: Mapped[UUID] = mapped_column(
         ForeignKey("organizations.id", onupdate="CASCADE", ondelete="CASCADE"),
-        nullable=False,
     )
 
-    user = orm.relationship(User, lazy=False)
-    organization = orm.relationship("Organization", lazy=False)
+    user: Mapped[User] = relationship(back_populates="organization_roles", lazy=False)
+    organization: Mapped[Organization] = relationship(
+        back_populates="roles", lazy=False
+    )
 
 
 class OrganizationProject(db.Model):
-
     __tablename__ = "organization_projects"
     __table_args__ = (
         Index("organization_projects_organization_id_idx", "organization_id"),
@@ -92,21 +103,18 @@ class OrganizationProject(db.Model):
 
     __repr__ = make_repr("project_id", "organization_id")
 
-    organization_id = Column(
+    organization_id: Mapped[UUID] = mapped_column(
         ForeignKey("organizations.id", onupdate="CASCADE", ondelete="CASCADE"),
-        nullable=False,
     )
-    project_id = Column(
+    project_id: Mapped[UUID] = mapped_column(
         ForeignKey("projects.id", onupdate="CASCADE", ondelete="CASCADE"),
-        nullable=False,
     )
 
-    organization = orm.relationship("Organization", lazy=False)
-    project = orm.relationship("Project", lazy=False)
+    organization: Mapped[Organization] = relationship(lazy=False)
+    project: Mapped[Project] = relationship(lazy=False)
 
 
 class OrganizationStripeSubscription(db.Model):
-
     __tablename__ = "organization_stripe_subscriptions"
     __table_args__ = (
         Index(
@@ -124,21 +132,18 @@ class OrganizationStripeSubscription(db.Model):
 
     __repr__ = make_repr("organization_id", "subscription_id")
 
-    organization_id = Column(
+    organization_id: Mapped[UUID] = mapped_column(
         ForeignKey("organizations.id", onupdate="CASCADE", ondelete="CASCADE"),
-        nullable=False,
     )
-    subscription_id = Column(
+    subscription_id: Mapped[UUID] = mapped_column(
         ForeignKey("stripe_subscriptions.id", onupdate="CASCADE", ondelete="CASCADE"),
-        nullable=False,
     )
 
-    organization = orm.relationship("Organization", lazy=False)
-    subscription = orm.relationship("StripeSubscription", lazy=False)
+    organization: Mapped[Organization] = relationship(lazy=False)
+    subscription: Mapped[StripeSubscription] = relationship(lazy=False)
 
 
 class OrganizationStripeCustomer(db.Model):
-
     __tablename__ = "organization_stripe_customers"
     __table_args__ = (
         Index("organization_stripe_customers_organization_id_idx", "organization_id"),
@@ -154,21 +159,18 @@ class OrganizationStripeCustomer(db.Model):
 
     __repr__ = make_repr("organization_id", "stripe_customer_id")
 
-    organization_id = Column(
+    organization_id: Mapped[UUID] = mapped_column(
         ForeignKey("organizations.id", onupdate="CASCADE", ondelete="CASCADE"),
-        nullable=False,
     )
-    stripe_customer_id = Column(
+    stripe_customer_id: Mapped[UUID] = mapped_column(
         ForeignKey("stripe_customers.id", onupdate="CASCADE", ondelete="CASCADE"),
-        nullable=False,
     )
 
-    organization = orm.relationship("Organization", lazy=False)
-    customer = orm.relationship("StripeCustomer", lazy=False)
+    organization: Mapped[Organization] = relationship(lazy=False)
+    customer: Mapped[StripeCustomer] = relationship(lazy=False)
 
 
 class OrganizationType(str, enum.Enum):
-
     Community = "Community"
     Company = "Company"
 
@@ -216,62 +218,89 @@ class OrganizationFactory:
             raise KeyError from None
 
 
-# TODO: Determine if this should also utilize SitemapMixin and TwoFactorRequireable
-# class Organization(SitemapMixin, TwoFactorRequireable, HasEvents, db.Model):
-class Organization(HasEvents, db.Model):
-    __tablename__ = "organizations"
-    __table_args__ = (
-        CheckConstraint(
-            "name ~* '^([A-Z0-9]|[A-Z0-9][A-Z0-9._-]*[A-Z0-9])$'::text",
-            name="organizations_valid_name",
-        ),
-        CheckConstraint(
-            "link_url ~* '^https?://.*'::text",
-            name="organizations_valid_link_url",
-        ),
+class OrganizationMixin:
+    @declared_attr
+    def __table_args__(cls):  # noqa: N805
+        return (
+            CheckConstraint(
+                "name ~* '^([A-Z0-9]|[A-Z0-9][A-Z0-9._-]*[A-Z0-9])$'::text",
+                name="%s_valid_name" % cls.__tablename__,
+            ),
+            CheckConstraint(
+                "link_url ~* '^https?://.*'::text",
+                name="%s_valid_link_url" % cls.__tablename__,
+            ),
+        )
+
+    name: Mapped[str] = mapped_column(comment="The account name used in URLS")
+
+    @declared_attr
+    def normalized_name(cls):  # noqa: N805
+        return column_property(func.normalize_pep426_name(cls.name))
+
+    display_name: Mapped[str] = mapped_column(comment="Display name used in UI")
+    orgtype: Mapped[enum.Enum] = mapped_column(
+        Enum(OrganizationType, values_callable=lambda x: [e.value for e in x]),
+        comment="What type of organization such as Community or Company",
     )
+    link_url: Mapped[str] = mapped_column(
+        comment="External URL associated with the organization"
+    )
+    description: Mapped[str] = mapped_column(
+        comment="Description of the business or project the organization represents",
+    )
+
+    is_approved: Mapped[bool | None] = mapped_column(
+        comment="Status of administrator approval of the request"
+    )
+
+
+# TODO: Determine if this should also utilize SitemapMixin
+class Organization(OrganizationMixin, HasEvents, db.Model):
+    __tablename__ = "organizations"
 
     __repr__ = make_repr("name")
 
-    name = Column(Text, nullable=False)
-    normalized_name = orm.column_property(func.normalize_pep426_name(name))
-    display_name = Column(Text, nullable=False)
-    orgtype = Column(
-        Enum(OrganizationType, values_callable=lambda x: [e.value for e in x]),
-        nullable=False,
+    is_active: Mapped[bool_false] = mapped_column(
+        comment="When True, the organization is active and all features are available.",
     )
-    link_url = Column(URLType, nullable=False)
-    description = Column(Text, nullable=False)
-    is_active = Column(Boolean, nullable=False, server_default=sql.false())
-    is_approved = Column(Boolean)
-    created = Column(
-        DateTime(timezone=False),
-        nullable=False,
-        server_default=sql.func.now(),
+    created: Mapped[datetime_now] = mapped_column(
         index=True,
+        comment="Datetime the organization was created.",
     )
-    date_approved = Column(
-        DateTime(timezone=False),
-        nullable=True,
+    date_approved: Mapped[datetime.datetime | None] = mapped_column(
         onupdate=func.now(),
+        comment="Datetime the organization was approved by administrators.",
+    )
+    application: Mapped[OrganizationApplication] = relationship(
+        back_populates="organization"
     )
 
-    users = orm.relationship(
-        User, secondary=OrganizationRole.__table__, backref="organizations", viewonly=True  # type: ignore # noqa
+    users: Mapped[list[User]] = relationship(
+        secondary=OrganizationRole.__table__,
+        back_populates="organizations",
+        viewonly=True,
     )
-    teams = orm.relationship(
-        "Team",
+    roles: Mapped[list[OrganizationRole]] = relationship(back_populates="organization")
+    teams: Mapped[list[Team]] = relationship(
         back_populates="organization",
-        order_by=lambda: Team.name.asc(),  # type: ignore
+        order_by=lambda: Team.name.asc(),
     )
-    projects = orm.relationship(
-        "Project", secondary=OrganizationProject.__table__, back_populates="organization", viewonly=True  # type: ignore # noqa
+    projects: Mapped[list[Project]] = relationship(
+        secondary=OrganizationProject.__table__,
+        back_populates="organization",
+        viewonly=True,
     )
-    customer = orm.relationship(
-        "StripeCustomer", secondary=OrganizationStripeCustomer.__table__, back_populates="organization", uselist=False, viewonly=True  # type: ignore # noqa
+    customer: Mapped[StripeCustomer] = relationship(
+        secondary=OrganizationStripeCustomer.__table__,
+        back_populates="organization",
+        uselist=False,
+        viewonly=True,
     )
-    subscriptions = orm.relationship(
-        "StripeSubscription", secondary=OrganizationStripeSubscription.__table__, back_populates="organization", viewonly=True  # type: ignore # noqa
+    subscriptions: Mapped[list[StripeSubscription]] = relationship(
+        secondary=OrganizationStripeSubscription.__table__,
+        back_populates="organization",
+        viewonly=True,
     )
 
     @property
@@ -294,11 +323,11 @@ class Organization(HasEvents, db.Model):
             .all()
         )
 
-    def record_event(self, *, tag, ip_address, additional={}):
+    def record_event(self, *, tag, request: Request = None, additional=None):
         """Record organization name in events in case organization is ever deleted."""
         super().record_event(
             tag=tag,
-            ip_address=ip_address,
+            request=request,
             additional={"organization_name": self.name, **additional},
         )
 
@@ -306,31 +335,43 @@ class Organization(HasEvents, db.Model):
         session = orm.object_session(self)
 
         acls = [
-            (Allow, "group:admins", "admin"),
-            (Allow, "group:moderators", "moderator"),
+            (
+                Allow,
+                "group:admins",
+                (
+                    Permissions.AdminOrganizationsRead,
+                    Permissions.AdminOrganizationsWrite,
+                ),
+            ),
+            (Allow, "group:moderators", Permissions.AdminOrganizationsRead),
         ]
 
         # Get all of the users for this organization.
         query = session.query(OrganizationRole).filter(
             OrganizationRole.organization == self
         )
-        query = query.options(orm.lazyload("organization"))
+        query = query.options(orm.lazyload(OrganizationRole.organization))
         query = query.join(User).order_by(User.id.asc())
         for role in sorted(
             query.all(),
             key=lambda x: [e.value for e in OrganizationRoleType].index(x.role_name),
         ):
+            # *** NOTE ***:
+            # When updating these ACLS, please also update the matrix in
+            # `warehouse/templates/manage/organization/roles.html` to ensure that
+            # the UI is consistent with the actual ACLs.
+            #
             # Allow all people in organization read access.
             # Allow write access depending on role.
             if role.role_name == OrganizationRoleType.Owner:
                 # Allowed:
-                # - View organization ("view:organization")
-                # - View team ("view:team")
-                # - Invite/remove organization member ("manage:organization")
-                # - Create/delete team and add/remove team member ("manage:team")
-                # - Manage billing ("manage:billing")
-                # - Add project ("add:project")
-                # - Remove project ("remove:project")
+                # - View organization (Permissions.OrganizationsRead)
+                # - View team (Permissions.OrganizationTeamsRead)
+                # - Invite/remove organization member (Permissions.OrganizationsManage)
+                # - Create/delete team and add/remove members (OrganizationTeamsManage)
+                # - Manage billing (Permissions.OrganizationsBillingManage)
+                # - Add project (Permissions.OrganizationProjectsAdd)
+                # - Remove project (Permissions.OrganizationProjectsRemove)
                 # Disallowed:
                 # - (none)
                 acls.append(
@@ -338,52 +379,56 @@ class Organization(HasEvents, db.Model):
                         Allow,
                         f"user:{role.user.id}",
                         [
-                            "view:organization",
-                            "view:team",
-                            "manage:organization",
-                            "manage:team",
-                            "manage:billing",
-                            "add:project",
-                            "remove:project",
+                            Permissions.OrganizationsRead,
+                            Permissions.OrganizationTeamsRead,
+                            Permissions.OrganizationsManage,
+                            Permissions.OrganizationTeamsManage,
+                            Permissions.OrganizationsBillingManage,
+                            Permissions.OrganizationProjectsAdd,
+                            Permissions.OrganizationProjectsRemove,
                         ],
                     )
                 )
             elif role.role_name == OrganizationRoleType.BillingManager:
                 # Allowed:
-                # - View organization ("view:organization")
-                # - View team ("view:team")
-                # - Manage billing ("manage:billing")
+                # - View organization (Permissions.OrganizationsRead)
+                # - View team (Permissions.OrganizationTeamsRead)
+                # - Manage billing (Permissions.OrganizationsBillingManage)
                 # Disallowed:
-                # - Invite/remove organization member ("manage:organization")
-                # - Create/delete team and add/remove team member ("manage:team")
-                # - Add project ("add:project")
-                # - Remove project ("remove:project")
-                acls.append(
-                    (
-                        Allow,
-                        f"user:{role.user.id}",
-                        ["view:organization", "view:team", "manage:billing"],
-                    )
-                )
-            elif role.role_name == OrganizationRoleType.Manager:
-                # Allowed:
-                # - View organization ("view:organization")
-                # - View team ("view:team")
-                # - Create/delete team and add/remove team member ("manage:team")
-                # - Add project ("add:project")
-                # Disallowed:
-                # - Invite/remove organization member ("manage:organization")
-                # - Manage billing ("manage:billing")
-                # - Remove project ("remove:project")
+                # - Invite/remove organization member (Permissions.OrganizationsManage)
+                # - Create/delete team and add/remove members (OrganizationTeamsManage)
+                # - Add project (Permissions.OrganizationProjectsAdd)
+                # - Remove project (Permissions.OrganizationProjectsRemove)
                 acls.append(
                     (
                         Allow,
                         f"user:{role.user.id}",
                         [
-                            "view:organization",
-                            "view:team",
-                            "manage:team",
-                            "add:project",
+                            Permissions.OrganizationsRead,
+                            Permissions.OrganizationTeamsRead,
+                            Permissions.OrganizationsBillingManage,
+                        ],
+                    )
+                )
+            elif role.role_name == OrganizationRoleType.Manager:
+                # Allowed:
+                # - View organization (Permissions.OrganizationsRead)
+                # - View team (Permissions.OrganizationTeamsRead)
+                # - Create/delete team and add/remove members (OrganizationTeamsManage)
+                # - Add project (Permissions.OrganizationProjectsAdd)
+                # Disallowed:
+                # - Invite/remove organization member (Permissions.OrganizationsManage)
+                # - Manage billing (Permissions.OrganizationsBillingManage)
+                # - Remove project (Permissions.OrganizationProjectsRemove)
+                acls.append(
+                    (
+                        Allow,
+                        f"user:{role.user.id}",
+                        [
+                            Permissions.OrganizationsRead,
+                            Permissions.OrganizationTeamsRead,
+                            Permissions.OrganizationTeamsManage,
+                            Permissions.OrganizationProjectsAdd,
                         ],
                     )
                 )
@@ -391,16 +436,23 @@ class Organization(HasEvents, db.Model):
                 # No member-specific write access needed for now.
 
                 # Allowed:
-                # - View organization ("view:organization")
-                # - View team ("view:team")
+                # - View organization (Permissions.OrganizationsRead)
+                # - View team (Permissions.OrganizationTeamsRead)
                 # Disallowed:
-                # - Invite/remove organization member ("manage:organization")
-                # - Create/delete team and add/remove team member ("manage:team")
-                # - Manage billing ("manage:billing")
-                # - Add project ("add:project")
-                # - Remove project ("remove:project")
+                # - Invite/remove organization member (Permissions.OrganizationsManage)
+                # - Create/delete team and add/remove members (OrganizationTeamsManage)
+                # - Manage billing (Permissions.OrganizationsBillingManage)
+                # - Add project (Permissions.OrganizationProjectsAdd)
+                # - Remove project (Permissions.OrganizationProjectsRemove)
                 acls.append(
-                    (Allow, f"user:{role.user.id}", ["view:organization", "view:team"])
+                    (
+                        Allow,
+                        f"user:{role.user.id}",
+                        [
+                            Permissions.OrganizationsRead,
+                            Permissions.OrganizationTeamsRead,
+                        ],
+                    )
                 )
         return acls
 
@@ -412,9 +464,51 @@ class Organization(HasEvents, db.Model):
         else:
             return None
 
+    def customer_name(self, site_name="PyPI"):
+        return f"{site_name} Organization - {self.display_name} ({self.name})"
+
+
+class OrganizationApplication(OrganizationMixin, db.Model):
+    __tablename__ = "organization_applications"
+    __repr__ = make_repr("name")
+
+    submitted_by_id: Mapped[UUID] = mapped_column(
+        PG_UUID,
+        ForeignKey(
+            User.id,
+            deferrable=True,
+            initially="DEFERRED",
+            ondelete="CASCADE",
+        ),
+        comment="ID of the User which submitted the request",
+    )
+    submitted: Mapped[datetime_now] = mapped_column(
+        index=True,
+        comment="Datetime the request was submitted",
+    )
+    organization_id: Mapped[UUID | None] = mapped_column(
+        PG_UUID,
+        ForeignKey(
+            Organization.id,
+            deferrable=True,
+            initially="DEFERRED",
+            ondelete="CASCADE",
+        ),
+        comment="If the request was approved, ID of resulting Organization",
+    )
+
+    submitted_by: Mapped[User] = relationship(
+        back_populates="organization_applications"
+    )
+    organization: Mapped[Organization] = relationship(
+        back_populates="application", viewonly=True
+    )
+
+    def __lt__(self, other: OrganizationApplication) -> bool:
+        return self.name < other.name
+
 
 class OrganizationNameCatalog(db.Model):
-
     __tablename__ = "organization_name_catalog"
     __table_args__ = (
         Index("organization_name_catalog_normalized_name_idx", "normalized_name"),
@@ -428,18 +522,16 @@ class OrganizationNameCatalog(db.Model):
 
     __repr__ = make_repr("normalized_name", "organization_id")
 
-    normalized_name = Column(Text, nullable=False, index=True)
-    organization_id = Column(UUID(as_uuid=True), nullable=True, index=True)
+    normalized_name: Mapped[str] = mapped_column(index=True)
+    organization_id: Mapped[UUID | None] = mapped_column(PG_UUID, index=True)
 
 
 class OrganizationInvitationStatus(enum.Enum):
-
     Pending = "pending"
     Expired = "expired"
 
 
 class OrganizationInvitation(db.Model):
-
     __tablename__ = "organization_invitations"
     __table_args__ = (
         Index("organization_invitations_user_id_idx", "user_id"),
@@ -452,35 +544,32 @@ class OrganizationInvitation(db.Model):
 
     __repr__ = make_repr("invite_status", "user", "organization")
 
-    invite_status = Column(
+    invite_status: Mapped[enum.Enum] = mapped_column(
         Enum(
             OrganizationInvitationStatus, values_callable=lambda x: [e.value for e in x]
         ),
-        nullable=False,
     )
-    token = Column(Text, nullable=False)
-    user_id = Column(
+    token: Mapped[str]
+    user_id: Mapped[UUID] = mapped_column(
         ForeignKey("users.id", onupdate="CASCADE", ondelete="CASCADE"),
-        nullable=False,
         index=True,
     )
-    organization_id = Column(
+    organization_id: Mapped[UUID] = mapped_column(
         ForeignKey("organizations.id", onupdate="CASCADE", ondelete="CASCADE"),
-        nullable=False,
         index=True,
     )
 
-    user = orm.relationship(User, lazy=False)
-    organization = orm.relationship("Organization", lazy=False)
+    user: Mapped[User] = relationship(
+        back_populates="organization_invitations", lazy=False
+    )
+    organization: Mapped[Organization] = relationship(lazy=False)
 
 
 class TeamRoleType(str, enum.Enum):
-
     Member = "Member"
 
 
 class TeamRole(db.Model):
-
     __tablename__ = "team_roles"
     __table_args__ = (
         Index("team_roles_user_id_idx", "user_id"),
@@ -494,30 +583,26 @@ class TeamRole(db.Model):
 
     __repr__ = make_repr("role_name", "team", "user")
 
-    role_name = Column(
+    role_name: Mapped[enum.Enum] = mapped_column(
         Enum(TeamRoleType, values_callable=lambda x: [e.value for e in x]),
-        nullable=False,
     )
-    user_id = Column(
-        ForeignKey("users.id", onupdate="CASCADE", ondelete="CASCADE"), nullable=False
+    user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("users.id", onupdate="CASCADE", ondelete="CASCADE"),
     )
-    team_id = Column(
+    team_id: Mapped[UUID] = mapped_column(
         ForeignKey("teams.id", onupdate="CASCADE", ondelete="CASCADE"),
-        nullable=False,
     )
 
-    user = orm.relationship(User, lazy=False)
-    team = orm.relationship("Team", lazy=False)
+    user: Mapped[User] = relationship(lazy=False)
+    team: Mapped[Team] = relationship(lazy=False)
 
 
 class TeamProjectRoleType(str, enum.Enum):
-
     Owner = "Owner"  # Granted "Administer" permissions.
     Maintainer = "Maintainer"  # Granted "Upload" permissions.
 
 
 class TeamProjectRole(db.Model):
-
     __tablename__ = "team_project_roles"
     __table_args__ = (
         Index("team_project_roles_project_id_idx", "project_id"),
@@ -531,28 +616,20 @@ class TeamProjectRole(db.Model):
 
     __repr__ = make_repr("role_name", "team", "project")
 
-    role_name = Column(
+    role_name: Mapped[enum.Enum] = mapped_column(
         Enum(TeamProjectRoleType, values_callable=lambda x: [e.value for e in x]),
-        nullable=False,
     )
-    project_id = Column(
+    project_id: Mapped[UUID] = mapped_column(
         ForeignKey("projects.id", onupdate="CASCADE", ondelete="CASCADE"),
-        nullable=False,
     )
-    team_id = Column(
+    team_id: Mapped[UUID] = mapped_column(
         ForeignKey("teams.id", onupdate="CASCADE", ondelete="CASCADE"),
-        nullable=False,
     )
 
-    project = orm.relationship(
-        "Project",
-        lazy=False,
-        back_populates="team_project_roles",
+    project: Mapped[Project] = relationship(
+        lazy=False, back_populates="team_project_roles"
     )
-    team = orm.relationship(
-        "Team",
-        lazy=False,
-    )
+    team: Mapped[Team] = relationship(lazy=False)
 
 
 class TeamFactory:
@@ -578,7 +655,6 @@ class TeamFactory:
 
 
 class Team(HasEvents, db.Model):
-
     __tablename__ = "teams"
     __table_args__ = (
         Index("teams_organization_id_idx", "organization_id"),
@@ -590,32 +666,28 @@ class Team(HasEvents, db.Model):
 
     __repr__ = make_repr("name", "organization")
 
-    name = Column(Text, nullable=False)
-    normalized_name = orm.column_property(func.normalize_team_name(name))
-    organization_id = Column(
+    name: Mapped[str] = mapped_column()
+    normalized_name: Mapped[str] = column_property(func.normalize_team_name(name))
+    organization_id: Mapped[UUID] = mapped_column(
         ForeignKey("organizations.id", onupdate="CASCADE", ondelete="CASCADE"),
-        nullable=False,
     )
-    created = Column(
-        DateTime(timezone=False),
-        nullable=False,
-        server_default=sql.func.now(),
-        index=True,
+    created: Mapped[datetime_now] = mapped_column(index=True)
+
+    organization: Mapped[Organization] = relationship(
+        lazy=False, back_populates="teams"
+    )
+    members: Mapped[list[User]] = relationship(
+        secondary=TeamRole.__table__, back_populates="teams", viewonly=True
+    )
+    projects: Mapped[list[Project]] = relationship(
+        secondary=TeamProjectRole.__table__, back_populates="team", viewonly=True
     )
 
-    organization = orm.relationship("Organization", lazy=False, back_populates="teams")
-    members = orm.relationship(
-        User, secondary=TeamRole.__table__, backref="teams", viewonly=True  # type: ignore # noqa
-    )
-    projects = orm.relationship(
-        "Project", secondary=TeamProjectRole.__table__, backref="teams", viewonly=True  # type: ignore # noqa
-    )
-
-    def record_event(self, *, tag, ip_address, additional={}):
+    def record_event(self, *, tag, request: Request = None, additional=None):
         """Record org and team name in events in case they are ever deleted."""
         super().record_event(
             tag=tag,
-            ip_address=ip_address,
+            request=request,
             additional={
                 "organization_name": self.organization.name,
                 "team_name": self.name,

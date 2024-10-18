@@ -25,10 +25,12 @@ import pretend
 import pyramid.testing
 import pytest
 import stripe
+import transaction
 import webtest as _webtest
 
 from jinja2 import Environment, FileSystemLoader
-from psycopg2.errors import InvalidCatalogName
+from psycopg.errors import InvalidCatalogName
+from pypi_attestations import Attestation, Envelope, VerificationMaterial
 from pyramid.i18n import TranslationString
 from pyramid.static import ManifestCacheBuster
 from pyramid_jinja2 import IJinja2Environment
@@ -43,14 +45,18 @@ from warehouse import admin, config, email, static
 from warehouse.accounts import services as account_services
 from warehouse.accounts.interfaces import ITokenService, IUserService
 from warehouse.admin.flags import AdminFlag, AdminFlagValue
+from warehouse.attestations import services as attestations_services
+from warehouse.attestations.interfaces import IIntegrityService
 from warehouse.email import services as email_services
 from warehouse.email.interfaces import IEmailSender
+from warehouse.helpdesk import services as helpdesk_services
+from warehouse.helpdesk.interfaces import IHelpDeskService
 from warehouse.macaroons import services as macaroon_services
 from warehouse.macaroons.interfaces import IMacaroonService
 from warehouse.metrics import IMetricsService
 from warehouse.oidc import services as oidc_services
 from warehouse.oidc.interfaces import IOIDCPublisherService
-from warehouse.oidc.utils import GITHUB_OIDC_ISSUER_URL
+from warehouse.oidc.utils import ACTIVESTATE_OIDC_ISSUER_URL, GITHUB_OIDC_ISSUER_URL
 from warehouse.organizations import services as organization_services
 from warehouse.organizations.interfaces import IOrganizationService
 from warehouse.packaging import services as packaging_services
@@ -60,24 +66,7 @@ from warehouse.subscriptions.interfaces import IBillingService, ISubscriptionSer
 
 from .common.db import Session
 from .common.db.accounts import EmailFactory, UserFactory
-
-
-def pytest_collection_modifyitems(items):
-    for item in items:
-        if not hasattr(item, "module"):  # e.g.: DoctestTextfile
-            continue
-
-        module_path = os.path.relpath(
-            item.module.__file__, os.path.commonprefix([__file__, item.module.__file__])
-        )
-
-        module_root_dir = module_path.split(os.pathsep)[0]
-        if module_root_dir.startswith("functional"):
-            item.add_marker(pytest.mark.functional)
-        elif module_root_dir.startswith("unit"):
-            item.add_marker(pytest.mark.unit)
-        else:
-            raise RuntimeError(f"Unknown test type (filename = {module_path})")
+from .common.db.ip_addresses import IpAddressFactory
 
 
 @contextmanager
@@ -85,15 +74,43 @@ def metrics_timing(*args, **kwargs):
     yield None
 
 
+def _event(
+    title,
+    text,
+    alert_type=None,
+    aggregation_key=None,
+    source_type_name=None,
+    date_happened=None,
+    priority=None,
+    tags=None,
+    hostname=None,
+):
+    return None
+
+
 @pytest.fixture
 def metrics():
+    """
+    A good-enough fake metrics fixture.
+    """
     return pretend.stub(
-        event=pretend.call_recorder(lambda *args, **kwargs: None),
-        increment=pretend.call_recorder(lambda *args, **kwargs: None),
-        histogram=pretend.call_recorder(lambda *args, **kwargs: None),
-        timing=pretend.call_recorder(lambda *args, **kwargs: None),
+        event=pretend.call_recorder(lambda *args, **kwargs: _event(*args, **kwargs)),
+        gauge=pretend.call_recorder(
+            lambda metric, value, tags=None, sample_rate=1: None
+        ),
+        increment=pretend.call_recorder(
+            lambda metric, value=1, tags=None, sample_rate=1: None
+        ),
+        histogram=pretend.call_recorder(
+            lambda metric, value, tags=None, sample_rate=1: None
+        ),
+        timing=pretend.call_recorder(
+            lambda metric, value, tags=None, sample_rate=1: None
+        ),
         timed=pretend.call_recorder(
-            lambda *args, **kwargs: metrics_timing(*args, **kwargs)
+            lambda metric=None, tags=None, sample_rate=1, use_ms=None: metrics_timing(
+                metric=metric, tags=tags, sample_rate=sample_rate, use_ms=use_ms
+            )
         ),
     )
 
@@ -101,6 +118,23 @@ def metrics():
 @pytest.fixture
 def remote_addr():
     return "1.2.3.4"
+
+
+@pytest.fixture
+def remote_addr_hashed():
+    """
+    Static output of `hashlib.sha256(remote_addr.encode("utf8")).hexdigest()`
+    Created statically to prevent needing to calculate it every run.
+    """
+    return "6694f83c9f476da31f5df6bcc520034e7e57d421d247b9d34f49edbfc84a764c"
+
+
+@pytest.fixture
+def remote_addr_salted():
+    """
+    Output of `hashlib.sha256((remote_addr + "pepa").encode("utf8")).hexdigest()`
+    """
+    return "a69a49383d81404e4b1df297c7baa28e1cd6c4ee1495ed5d0ab165a63a147763"
 
 
 @pytest.fixture
@@ -140,8 +174,11 @@ def pyramid_services(
     token_service,
     user_service,
     project_service,
-    oidc_service,
+    github_oidc_service,
+    activestate_oidc_service,
+    integrity_service,
     macaroon_service,
+    helpdesk_service,
 ):
     services = _Services()
 
@@ -155,22 +192,40 @@ def pyramid_services(
     services.register_service(token_service, ITokenService, None, name="email")
     services.register_service(user_service, IUserService, None, name="")
     services.register_service(project_service, IProjectService, None, name="")
-    services.register_service(oidc_service, IOIDCPublisherService, None, name="github")
+    services.register_service(
+        github_oidc_service, IOIDCPublisherService, None, name="github"
+    )
+    services.register_service(
+        activestate_oidc_service, IOIDCPublisherService, None, name="activestate"
+    )
+    services.register_service(integrity_service, IIntegrityService, None)
     services.register_service(macaroon_service, IMacaroonService, None, name="")
+    services.register_service(helpdesk_service, IHelpDeskService, None)
 
     return services
 
 
 @pytest.fixture
-def pyramid_request(pyramid_services, jinja, remote_addr):
+def pyramid_request(pyramid_services, jinja, remote_addr, remote_addr_hashed):
     pyramid.testing.setUp()
     dummy_request = pyramid.testing.DummyRequest()
     dummy_request.find_service = pyramid_services.find_service
     dummy_request.remote_addr = remote_addr
+    dummy_request.remote_addr_hashed = remote_addr_hashed
     dummy_request.authentication_method = pretend.stub()
     dummy_request._unauthenticated_userid = None
+    dummy_request.user = None
+    dummy_request.oidc_publisher = None
+    dummy_request.metrics = dummy_request.find_service(IMetricsService)
 
     dummy_request.registry.registerUtility(jinja, IJinja2Environment, name=".jinja2")
+
+    dummy_request._task_stub = pretend.stub(
+        delay=pretend.call_recorder(lambda *a, **kw: None)
+    )
+    dummy_request.task = pretend.call_recorder(
+        lambda *a, **kw: dummy_request._task_stub
+    )
 
     def localize(message, **kwargs):
         ts = TranslationString(message, **kwargs)
@@ -205,15 +260,21 @@ def cli():
 
 
 @pytest.fixture(scope="session")
-def database(request):
+def database(request, worker_id):
     config = get_config(request)
     pg_host = config.get("host")
     pg_port = config.get("port") or os.environ.get("PGPORT", 5432)
     pg_user = config.get("user")
-    pg_db = config.get("db", "tests")
-    pg_version = config.get("version", 14.4)
+    pg_db = f"tests-{worker_id}"
+    pg_version = config.get("version", 16.1)
 
-    janitor = DatabaseJanitor(pg_user, pg_host, pg_port, pg_db, pg_version)
+    janitor = DatabaseJanitor(
+        user=pg_user,
+        host=pg_host,
+        port=pg_port,
+        dbname=pg_db,
+        version=pg_version,
+    )
 
     # In case the database already exists, possibly due to an aborted test run,
     # attempt to drop it before creating
@@ -232,7 +293,7 @@ def database(request):
     def drop_database():
         janitor.drop()
 
-    return f"postgresql://{pg_user}@{pg_host}:{pg_port}/{pg_db}"
+    return f"postgresql+psycopg://{pg_user}@{pg_host}:{pg_port}/{pg_db}"
 
 
 class MockManifestCacheBuster(ManifestCacheBuster):
@@ -248,11 +309,11 @@ def mock_manifest_cache_buster():
     return MockManifestCacheBuster
 
 
-@pytest.fixture(scope="session")
-def app_config(database):
+def get_app_config(database, nondefaults=None):
     settings = {
         "warehouse.prevent_esi": True,
         "warehouse.token": "insecure token",
+        "warehouse.ip_salt": "insecure salt",
         "camo.url": "http://localhost:9000/",
         "camo.key": "insecure key",
         "celery.broker_url": "amqp://",
@@ -261,48 +322,65 @@ def app_config(database):
         "database.url": database,
         "docs.url": "http://docs.example.com/",
         "ratelimit.url": "memory://",
-        "elasticsearch.url": "https://localhost/warehouse",
+        "opensearch.url": "https://localhost/warehouse",
         "files.backend": "warehouse.packaging.services.LocalFileStorage",
+        "archive_files.backend": "warehouse.packaging.services.LocalArchiveFileStorage",
+        "archive_files.path": "/tmp",
         "simple.backend": "warehouse.packaging.services.LocalSimpleStorage",
         "docs.backend": "warehouse.packaging.services.LocalDocsStorage",
         "sponsorlogos.backend": "warehouse.admin.services.LocalSponsorLogoStorage",
         "billing.backend": "warehouse.subscriptions.services.MockStripeBillingService",
+        "integrity.backend": "warehouse.attestations.services.NullIntegrityService",
+        "billing.api_base": "http://stripe:12111",
+        "billing.api_version": "2020-08-27",
         "mail.backend": "warehouse.email.services.SMTPEmailSender",
-        "malware_check.backend": (
-            "warehouse.malware.services.PrinterMalwareCheckService"
-        ),
+        "helpdesk.backend": "warehouse.helpdesk.services.ConsoleHelpDeskService",
         "files.url": "http://localhost:7000/",
+        "archive_files.url": "http://localhost:7000/archive",
         "sessions.secret": "123456",
         "sessions.url": "redis://localhost:0/",
         "statuspage.url": "https://2p66nmmycsj3.statuspage.io",
         "warehouse.xmlrpc.cache.url": "redis://localhost:0/",
     }
+
+    if nondefaults:
+        settings.update(nondefaults)
+
     with mock.patch.object(config, "ManifestCacheBuster", MockManifestCacheBuster):
         with mock.patch("warehouse.admin.ManifestCacheBuster", MockManifestCacheBuster):
             with mock.patch.object(static, "whitenoise_add_manifest"):
                 cfg = config.configure(settings=settings)
 
-    # Ensure our migrations have been ran.
+    # Run migrations:
+    # This might harmlessly run multiple times if there are several app config fixtures
+    # in the test session, using the same database.
     alembic.command.upgrade(cfg.alembic_config(), "head")
 
     return cfg
 
 
-@pytest.fixture
-def db_session(app_config):
-    engine = app_config.registry["sqlalchemy.engine"]
+@contextmanager
+def get_db_session_for_app_config(app_config):
+    """
+    Refactor: This helper function is designed to help fixtures yield a database
+    session for a particular app_config.
+
+    It needs the app_config in order to fetch the database engine that's owned
+    by the config.
+    """
+
+    # TODO: We possibly accept 2 instances of the sqlalchemy engine.
+    # There's a bit of circular dependencies in place:
+    # 1) To create a database session, we need to create an app config registry
+    #    and read config.registry["sqlalchemy.engine"]
+    # 2) To create an app config registry, we need to be able to dictate the
+    #    database session through the initial config.
+    #
+    # 1) and 2) clash.
+    engine = app_config.registry["sqlalchemy.engine"]  # get_sqlalchemy_engine(database)
     conn = engine.connect()
     trans = conn.begin()
-    session = Session(bind=conn)
-
-    # Start the session in a SAVEPOINT
-    session.begin_nested()
-
-    # Then each time that SAVEPOINT ends, reopen it
-    @event.listens_for(session, "after_transaction_end")
-    def restart_savepoint(session, transaction):
-        if transaction.nested and not transaction._parent.nested:
-            session.begin_nested()
+    session = Session(bind=conn, join_transaction_mode="create_savepoint")
 
     try:
         yield session
@@ -314,6 +392,37 @@ def db_session(app_config):
         engine.dispose()
 
 
+@pytest.fixture(scope="session")
+def app_config(database):
+    return get_app_config(database)
+
+
+@pytest.fixture(scope="session")
+def app_config_dbsession_from_env(database):
+    nondefaults = {
+        "warehouse.db_create_session": lambda r: r.environ.get("warehouse.db_session"),
+        "breached_passwords.backend": "warehouse.accounts.services.NullPasswordBreachedService",  # noqa: E501
+        "token.two_factor.secret": "insecure token",
+        # A running redis service is required for functional web sessions
+        "sessions.url": "redis://redis:0/",
+    }
+
+    return get_app_config(database, nondefaults)
+
+
+@pytest.fixture
+def db_session(app_config):
+    """
+    Refactor:
+
+    This fixture actually manages a specific app_config paired with a database
+    connection. For this reason, it's suggested to change the name to
+    db_and_app, and yield both app_config and db_session.
+    """
+    with get_db_session_for_app_config(app_config) as _db_session:
+        yield _db_session
+
+
 @pytest.fixture
 def user_service(db_session, metrics, remote_addr):
     return account_services.DatabaseUserService(
@@ -322,12 +431,14 @@ def user_service(db_session, metrics, remote_addr):
 
 
 @pytest.fixture
-def project_service(db_session, remote_addr):
-    return packaging_services.ProjectService(db_session, remote_addr)
+def project_service(db_session, metrics, ratelimiters=None):
+    return packaging_services.ProjectService(
+        db_session, metrics, ratelimiters=ratelimiters
+    )
 
 
 @pytest.fixture
-def oidc_service(db_session):
+def github_oidc_service(db_session):
     # We pretend to be a verifier for GitHub OIDC JWTs, for the purposes of testing.
     return oidc_services.NullOIDCPublisherService(
         db_session,
@@ -335,7 +446,125 @@ def oidc_service(db_session):
         GITHUB_OIDC_ISSUER_URL,
         pretend.stub(),
         pretend.stub(),
+        pretend.stub(),
     )
+
+
+@pytest.fixture
+def dummy_github_oidc_jwt():
+    # {
+    #  "jti": "6e67b1cb-2b8d-4be5-91cb-757edb2ec970",
+    #  "sub": "repo:foo/bar",
+    #  "aud": "pypi",
+    #  "ref": "fake",
+    #  "sha": "fake",
+    #  "repository": "foo/bar",
+    #  "repository_owner": "foo",
+    #  "repository_owner_id": "123",
+    #  "run_id": "fake",
+    #  "run_number": "fake",
+    #  "run_attempt": "1",
+    #  "repository_id": "fake",
+    #  "actor_id": "fake",
+    #  "actor": "foo",
+    #  "workflow": "fake",
+    #  "head_ref": "fake",
+    #  "base_ref": "fake",
+    #  "event_name": "fake",
+    #  "ref_type": "fake",
+    #  "environment": "fake",
+    #  "job_workflow_ref": "foo/bar/.github/workflows/example.yml@fake",
+    #  "iss": "https://token.actions.githubusercontent.com",
+    #  "nbf": 1650663265,
+    #  "exp": 1650664165,
+    #  "iat": 1650663865
+    # }
+    return (
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiI2ZTY3YjFjYi0yYjhkLTRiZ"
+        "TUtOTFjYi03NTdlZGIyZWM5NzAiLCJzdWIiOiJyZXBvOmZvby9iYXIiLCJhdWQiOiJweXB"
+        "pIiwicmVmIjoiZmFrZSIsInNoYSI6ImZha2UiLCJyZXBvc2l0b3J5IjoiZm9vL2JhciIsI"
+        "nJlcG9zaXRvcnlfb3duZXIiOiJmb28iLCJyZXBvc2l0b3J5X293bmVyX2lkIjoiMTIzIiw"
+        "icnVuX2lkIjoiZmFrZSIsInJ1bl9udW1iZXIiOiJmYWtlIiwicnVuX2F0dGVtcHQiOiIxI"
+        "iwicmVwb3NpdG9yeV9pZCI6ImZha2UiLCJhY3Rvcl9pZCI6ImZha2UiLCJhY3RvciI6ImZ"
+        "vbyIsIndvcmtmbG93IjoiZmFrZSIsImhlYWRfcmVmIjoiZmFrZSIsImJhc2VfcmVmIjoiZ"
+        "mFrZSIsImV2ZW50X25hbWUiOiJmYWtlIiwicmVmX3R5cGUiOiJmYWtlIiwiZW52aXJvbm1"
+        "lbnQiOiJmYWtlIiwiam9iX3dvcmtmbG93X3JlZiI6ImZvby9iYXIvLmdpdGh1Yi93b3JrZ"
+        "mxvd3MvZXhhbXBsZS55bWxAZmFrZSIsImlzcyI6Imh0dHBzOi8vdG9rZW4uYWN0aW9ucy5"
+        "naXRodWJ1c2VyY29udGVudC5jb20iLCJuYmYiOjE2NTA2NjMyNjUsImV4cCI6MTY1MDY2N"
+        "DE2NSwiaWF0IjoxNjUwNjYzODY1fQ.f-FMv5FF5sdxAWeUilYDt9NoE7Et0vbdNhK32c2o"
+        "C-E"
+    )
+
+
+@pytest.fixture
+def dummy_activestate_oidc_jwt():
+    # {
+    #   "jti": "6e67b1cb-2b8d-4be5-91cb-757edb2ec970",
+    #   "sub": "org:fakeorg:project:fakeproject",
+    #   "aud": "pypi",
+    #   "actor_id": "fake",
+    #   "actor": "foo",
+    #   "oraganization_id": "7e67b1cb-2b8d-4be5-91cb-757edb2ec970",
+    #   "organization": "fakeorg",
+    #   "project_visibility": "private",
+    #   "project_id": "8e67b1cb-2b8d-4be5-91cb-757edb2ec970",
+    #   "project_path": "fakeorg/fakeproject",
+    #   "project": "fakeproject",
+    #   "builder": "pypi_builder",
+    #   "ingredient_name": "fakeingredient",
+    #   "artifact_id": "9e67b1cb-2b8d-4be5-91cb-757edb2ec970",
+    #   "iss":"https://platform.activestate.com/api/v1/oauth/oidc",
+    #   "nbf": 1650663265,
+    #   "exp": 1650664165,
+    #   "iat": 1650663865
+    # }
+    return (
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiI2ZTY3YjFjYi0yYjhkLTRi"
+        "ZTUtOTFjYi03NTdlZGIyZWM5NzAiLCJzdWIiOiJvcmc6ZmFrZW9yZzpwcm9qZWN0OmZha"
+        "2Vwcm9qZWN0IiwiYXVkIjoicHlwaSIsImFjdG9yX2lkIjoiZmFrZSIsImFjdG9yIjoiZm"
+        "9vIiwib3JhZ2FuaXphdGlvbl9pZCI6IjdlNjdiMWNiLTJiOGQtNGJlNS05MWNiLTc1N2V"
+        "kYjJlYzk3MCIsIm9yZ2FuaXphdGlvbiI6ImZha2VvcmciLCJwcm9qZWN0X3Zpc2liaWxp"
+        "dHkiOiJwcml2YXRlIiwicHJvamVjdF9pZCI6IjhlNjdiMWNiLTJiOGQtNGJlNS05MWNiL"
+        "Tc1N2VkYjJlYzk3MCIsInByb2plY3RfcGF0aCI6ImZha2VvcmcvZmFrZXByb2plY3QiLC"
+        "Jwcm9qZWN0IjoiZmFrZXByb2plY3QiLCJidWlsZGVyIjoicHlwaV9idWlsZGVyIiwiaW5"
+        "ncmVkaWVudF9uYW1lIjoiZmFrZWluZ3JlZGllbnQiLCJhcnRpZmFjdF9pZCI6IjllNjdi"
+        "MWNiLTJiOGQtNGJlNS05MWNiLTc1N2VkYjJlYzk3MCIsImlzcyI6Imh0dHBzOi8vcGxhd"
+        "GZvcm0uYWN0aXZlc3RhdGUuY29tL2FwaS92MS9vYXV0aC9vaWRjIiwibmJmIjoxNjUwNj"
+        "YzMjY1LCJleHAiOjE2NTA2NjQxNjUsImlhdCI6MTY1MDY2Mzg2NX0.R4q-vWAFXHrBSBK"
+        "AZuHHIsGOkqlirPxEtLfjLIDiLr0"
+    )
+
+
+@pytest.fixture
+def activestate_oidc_service(db_session):
+    # We pretend to be a verifier for GitHub OIDC JWTs, for the purposes of testing.
+    return oidc_services.NullOIDCPublisherService(
+        db_session,
+        pretend.stub(),
+        ACTIVESTATE_OIDC_ISSUER_URL,
+        pretend.stub(),
+        pretend.stub(),
+        pretend.stub(),
+    )
+
+
+@pytest.fixture
+def dummy_attestation():
+    return Attestation(
+        version=1,
+        verification_material=VerificationMaterial(
+            certificate="somebase64string", transparency_entries=[dict()]
+        ),
+        envelope=Envelope(
+            statement="somebase64string",
+            signature="somebase64string",
+        ),
+    )
+
+
+@pytest.fixture
+def integrity_service(db_session):
+    return attestations_services.NullIntegrityService(db_session)
 
 
 @pytest.fixture
@@ -344,10 +573,8 @@ def macaroon_service(db_session):
 
 
 @pytest.fixture
-def organization_service(db_session, remote_addr):
-    return organization_services.DatabaseOrganizationService(
-        db_session, remote_addr=remote_addr
-    )
+def organization_service(db_session):
+    return organization_services.DatabaseOrganizationService(db_session)
 
 
 @pytest.fixture
@@ -377,6 +604,11 @@ def email_service():
     return email_services.SMTPEmailSender(
         mailer=DummyMailer(), sender="noreply@pypi.dev"
     )
+
+
+@pytest.fixture
+def helpdesk_service():
+    return helpdesk_services.ConsoleHelpDeskService()
 
 
 class QueryRecorder:
@@ -422,14 +654,17 @@ def db_request(pyramid_request, db_session):
     pyramid_request.db = db_session
     pyramid_request.flags = admin.flags.Flags(pyramid_request)
     pyramid_request.banned = admin.bans.Bans(pyramid_request)
+    pyramid_request.organization_access = True
+    pyramid_request.ip_address = IpAddressFactory.create(
+        ip_address=pyramid_request.remote_addr,
+        hashed_ip_address=pyramid_request.remote_addr_hashed,
+    )
     return pyramid_request
 
 
 @pytest.fixture
-def enable_organizations(db_request):
-    flag = db_request.db.query(AdminFlag).get(
-        AdminFlagValue.DISABLE_ORGANIZATIONS.value
-    )
+def _enable_organizations(db_request):
+    flag = db_request.db.get(AdminFlag, AdminFlagValue.DISABLE_ORGANIZATIONS.value)
     flag.enabled = False
     yield
     flag.enabled = True
@@ -477,30 +712,48 @@ class _TestApp(_webtest.TestApp):
 
 
 @pytest.fixture
-def webtest(app_config):
-    # TODO: Ensure that we have per test isolation of the database level
-    #       changes. This probably involves flushing the database or something
-    #       between test cases to wipe any committed changes.
+def tm():
+    # Create a new transaction manager for dependant test cases
+    tm = transaction.TransactionManager(explicit=True)
+    tm.begin()
+    tm.doom()
+
+    yield tm
+
+    # Abort the transaction, leaving database in previous state
+    tm.abort()
+
+
+@pytest.fixture
+def webtest(app_config_dbsession_from_env, remote_addr, tm):
+    """
+    This fixture yields a test app with an alternative Pyramid configuration,
+    injecting the database session and transaction manager into the app.
+
+    This is because the Warehouse app normally manages its own database session.
+
+    After the fixture has yielded the app, the transaction is rolled back and
+    the database is left in its previous state.
+    """
 
     # We want to disable anything that relies on TLS here.
-    app_config.add_settings(enforce_https=False)
+    app_config_dbsession_from_env.add_settings(enforce_https=False)
 
-    try:
-        yield _TestApp(app_config.make_wsgi_app())
-    finally:
-        app_config.registry["sqlalchemy.engine"].dispose()
+    app = app_config_dbsession_from_env.make_wsgi_app()
 
-
-@pytest.fixture(scope="session")
-def monkeypatch_session():
-    # NOTE: This is a minor hack to avoid duplicate monkeypatching
-    # on every function scope for dummy_localize.
-    # https://github.com/pytest-dev/pytest/issues/1872#issuecomment-375108891
-    from _pytest.monkeypatch import MonkeyPatch
-
-    m = MonkeyPatch()
-    yield m
-    m.undo()
+    with get_db_session_for_app_config(app_config_dbsession_from_env) as _db_session:
+        # Register the app with the external test environment, telling
+        # request.db to use this db_session and use the Transaction manager.
+        testapp = _TestApp(
+            app,
+            extra_environ={
+                "warehouse.db_session": _db_session,
+                "tm.active": True,  # disable pyramid_tm
+                "tm.manager": tm,  # pass in our own tm for the app to use
+                "REMOTE_ADDR": remote_addr,  # set the same address for all requests
+            },
+        )
+        yield testapp
 
 
 class _MockRedis:
@@ -554,11 +807,14 @@ class _MockRedis:
     def pipeline(self):
         return self
 
+    def register_script(self, script):
+        return script
+
     def scan_iter(self, search, count):
         del count  # unused
         return [key for key in self.cache.keys() if re.search(search, key)]
 
-    def set(self, key, value):
+    def set(self, key, value, *_args, **_kwargs):
         self.cache[key] = value
 
     def setex(self, key, value, _seconds):
@@ -567,5 +823,4 @@ class _MockRedis:
 
 @pytest.fixture
 def mockredis():
-    mock_redis = _MockRedis()
-    yield mock_redis
+    return _MockRedis()

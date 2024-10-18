@@ -17,7 +17,6 @@ from natsort import natsorted
 from pyramid.httpexceptions import HTTPMovedPermanently, HTTPNotFound
 
 from warehouse.packaging import views
-from warehouse.utils import readme
 
 from ...common.db.accounts import UserFactory
 from ...common.db.classifiers import ClassifierFactory
@@ -176,53 +175,6 @@ class TestReleaseDetail:
             pretend.call(name=release.project.name, version=release.version)
         ]
 
-    def test_detail_render_plain(self, db_request):
-        users = [UserFactory.create(), UserFactory.create(), UserFactory.create()]
-        project = ProjectFactory.create()
-        releases = [
-            ReleaseFactory.create(
-                project=project,
-                version=v,
-                description=DescriptionFactory.create(
-                    raw="plaintext description",
-                    html="",
-                    content_type="text/plain",
-                ),
-            )
-            for v in ["1.0", "2.0", "3.0", "4.0.dev0"]
-        ]
-        files = [
-            FileFactory.create(
-                release=r,
-                filename=f"{project.name}-{r.version}.tar.gz",
-                python_version="source",
-                packagetype="sdist",
-            )
-            for r in releases
-        ]
-
-        # Create a role for each user
-        for user in users:
-            RoleFactory.create(user=user, project=project)
-
-        result = views.release_detail(releases[1], db_request)
-
-        assert result == {
-            "project": project,
-            "release": releases[1],
-            "files": [files[1]],
-            "sdists": [files[1]],
-            "bdists": [],
-            "description": "<pre>plaintext description</pre>",
-            "latest_version": project.latest_version,
-            "all_versions": [
-                (r.version, r.created, r.is_prerelease, r.yanked)
-                for r in reversed(releases)
-            ],
-            "maintainers": sorted(users, key=lambda u: u.username.lower()),
-            "license": None,
-        }
-
     def test_detail_rendered(self, db_request):
         users = [UserFactory.create(), UserFactory.create(), UserFactory.create()]
         project = ProjectFactory.create()
@@ -237,51 +189,18 @@ class TestReleaseDetail:
                 ),
             )
             for v in ["1.0", "2.0", "3.0", "4.0.dev0"]
-        ]
-        files = [
-            FileFactory.create(
-                release=r,
-                filename=f"{project.name}-{r.version}.tar.gz",
-                python_version="source",
-                packagetype="sdist",
-            )
-            for r in releases
-        ]
-
-        # Create a role for each user
-        for user in users:
-            RoleFactory.create(user=user, project=project)
-
-        result = views.release_detail(releases[1], db_request)
-
-        assert result == {
-            "project": project,
-            "release": releases[1],
-            "files": [files[1]],
-            "sdists": [files[1]],
-            "bdists": [],
-            "description": "rendered description",
-            "latest_version": project.latest_version,
-            "all_versions": [
-                (r.version, r.created, r.is_prerelease, r.yanked)
-                for r in reversed(releases)
-            ],
-            "maintainers": sorted(users, key=lambda u: u.username.lower()),
-            "license": None,
-        }
-
-    def test_detail_renders(self, monkeypatch, db_request):
-        users = [UserFactory.create(), UserFactory.create(), UserFactory.create()]
-        project = ProjectFactory.create()
-        releases = [
+        ] + [
             ReleaseFactory.create(
                 project=project,
-                version=v,
+                version="5.0",
                 description=DescriptionFactory.create(
-                    raw="unrendered description", html="", content_type="text/html"
+                    raw="plaintext description",
+                    html="",
+                    content_type="text/plain",
                 ),
+                yanked=True,
+                yanked_reason="plaintext yanked reason",
             )
-            for v in ["1.0", "2.0", "3.0", "4.0.dev0"]
         ]
         files = [
             FileFactory.create(
@@ -297,12 +216,6 @@ class TestReleaseDetail:
         for user in users:
             RoleFactory.create(user=user, project=project)
 
-        # patch the readme rendering logic.
-        render_description = pretend.call_recorder(
-            lambda raw, content_type: "rendered description"
-        )
-        monkeypatch.setattr(readme, "render", render_description)
-
         result = views.release_detail(releases[1], db_request)
 
         assert result == {
@@ -314,16 +227,12 @@ class TestReleaseDetail:
             "description": "rendered description",
             "latest_version": project.latest_version,
             "all_versions": [
-                (r.version, r.created, r.is_prerelease, r.yanked)
+                (r.version, r.created, r.is_prerelease, r.yanked, r.yanked_reason)
                 for r in reversed(releases)
             ],
             "maintainers": sorted(users, key=lambda u: u.username.lower()),
             "license": None,
         }
-
-        assert render_description.calls == [
-            pretend.call("unrendered description", "text/html")
-        ]
 
     def test_detail_renders_files_natural_sort(self, db_request):
         """Tests that when a release has multiple versions of Python,
@@ -413,6 +322,81 @@ class TestReleaseDetail:
             "Multiline License is very long, so long that it is far longer than 100 "
             "characters, it's really so lo..."
         )
+
+
+class TestReportMalwareButton:
+    def test_report_malware_button(self):
+        project = pretend.stub()
+        assert views.includes_submit_malware_observation(project, pretend.stub()) == {
+            "project": project
+        }
+
+
+class TestProjectSubmitMalwareObservation:
+    def test_get_render_form(self, pyramid_request):
+        project = pretend.stub()
+        form_obj = pretend.stub()
+        form_class = pretend.call_recorder(lambda d, **kw: form_obj)
+
+        result = views.submit_malware_observation(
+            project, pyramid_request, _form_class=form_class
+        )
+
+        assert result == {"project": project, "form": form_obj}
+        assert form_class.calls == [pretend.call(pyramid_request.POST)]
+
+    def test_post_invalid_form(self, pyramid_request):
+        project = pretend.stub()
+        form_obj = pretend.stub()
+        form_obj.validate = pretend.call_recorder(lambda: False)
+        form_class = pretend.call_recorder(lambda d, **kw: form_obj)
+
+        pyramid_request.method = "POST"
+
+        result = views.submit_malware_observation(
+            project, pyramid_request, _form_class=form_class
+        )
+
+        assert result == {"project": project, "form": form_obj}
+        assert form_obj.validate.calls == [pretend.call()]
+
+    def test_post_valid_form(self, db_request):
+        user = UserFactory.create()
+        project = ProjectFactory.create()
+        form_obj = pretend.stub()
+        form_obj.inspector_link = pretend.stub(
+            data=f"https://inspector.pypi.io/project/{project.name}/"
+        )
+        form_obj.summary = pretend.stub(data="Bad stuff in here")
+        form_obj.validate = pretend.call_recorder(lambda: True)
+        form_class = pretend.call_recorder(lambda d, **kw: form_obj)
+
+        db_request.method = "POST"
+        db_request.route_path = pretend.call_recorder(
+            lambda *a, **kw: f"/project/{project.name}/"
+        )
+        db_request.session = pretend.stub(
+            flash=pretend.call_recorder(lambda *a, **kw: None)
+        )
+        db_request.user = user
+
+        result = views.submit_malware_observation(
+            project, db_request, _form_class=form_class
+        )
+
+        assert isinstance(result, HTTPMovedPermanently)
+        assert result.headers["Location"] == f"/project/{project.name}/"
+        assert form_obj.validate.calls == [pretend.call()]
+        assert db_request.session.flash.calls == [
+            pretend.call(
+                "Your report has been recorded. Thank you for your help.",
+                queue="success",
+            )
+        ]
+        assert db_request.route_path.calls == [
+            pretend.call("packaging.project", name=project.name)
+        ]
+        assert len(project.observations) == 1
 
 
 class TestEditProjectButton:
