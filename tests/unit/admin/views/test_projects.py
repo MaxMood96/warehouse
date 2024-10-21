@@ -17,17 +17,26 @@ from unittest import mock
 import pretend
 import pytest
 
+from paginate_sqlalchemy import SqlalchemyOrmPage
 from pyramid.httpexceptions import HTTPBadRequest, HTTPMovedPermanently, HTTPSeeOther
+from sqlalchemy.orm import joinedload
+
+import warehouse.constants
 
 from tests.common.db.oidc import GitHubPublisherFactory
 from warehouse.admin.views import projects as views
+from warehouse.observations.models import ObservationKind
 from warehouse.packaging.models import Project, Role
+from warehouse.packaging.tasks import update_release_description
 from warehouse.search.tasks import reindex_project
+from warehouse.utils.paginate import paginate_url_factory
 
 from ....common.db.accounts import UserFactory
+from ....common.db.observations import ObserverFactory
 from ....common.db.packaging import (
     JournalEntryFactory,
     ProjectFactory,
+    ProjectObservationFactory,
     ReleaseFactory,
     RoleFactory,
 )
@@ -36,7 +45,7 @@ from ....common.db.packaging import (
 class TestProjectList:
     def test_no_query(self, db_request):
         projects = sorted(
-            [ProjectFactory.create() for _ in range(30)],
+            ProjectFactory.create_batch(30),
             key=lambda p: p.normalized_name,
         )
         result = views.project_list(db_request)
@@ -45,7 +54,7 @@ class TestProjectList:
 
     def test_with_page(self, db_request):
         projects = sorted(
-            [ProjectFactory.create() for _ in range(30)],
+            ProjectFactory.create_batch(30),
             key=lambda p: p.normalized_name,
         )
         db_request.GET["page"] = "2"
@@ -61,7 +70,7 @@ class TestProjectList:
 
     def test_basic_query(self, db_request):
         projects = sorted(
-            [ProjectFactory.create() for _ in range(5)], key=lambda p: p.normalized_name
+            ProjectFactory.create_batch(5), key=lambda p: p.normalized_name
         )
         db_request.GET["q"] = projects[0].name
         result = views.project_list(db_request)
@@ -77,15 +86,15 @@ class TestProjectDetail:
     def test_gets_project(self, db_request):
         project = ProjectFactory.create()
         journals = sorted(
-            [JournalEntryFactory(name=project.name) for _ in range(75)],
+            JournalEntryFactory.create_batch(75, name=project.name),
             key=lambda x: (x.submitted_date, x.id),
             reverse=True,
         )
         roles = sorted(
-            [RoleFactory(project=project) for _ in range(5)],
+            RoleFactory.create_batch(5, project=project),
             key=lambda x: (x.role_name, x.user.username),
         )
-        oidc_publishers = [GitHubPublisherFactory(projects=[project]) for _ in range(5)]
+        oidc_publishers = GitHubPublisherFactory.create_batch(5, projects=[project])
         db_request.matchdict["project_name"] = str(project.normalized_name)
         result = views.project_detail(project, db_request)
 
@@ -95,11 +104,13 @@ class TestProjectDetail:
             "maintainers": roles,
             "journal": journals[:30],
             "oidc_publishers": oidc_publishers,
-            "ONE_MB": views.ONE_MB,
-            "MAX_FILESIZE": views.MAX_FILESIZE,
-            "MAX_PROJECT_SIZE": views.MAX_PROJECT_SIZE,
-            "ONE_GB": views.ONE_GB,
+            "ONE_MIB": views.ONE_MIB,
+            "MAX_FILESIZE": warehouse.constants.MAX_FILESIZE,
+            "MAX_PROJECT_SIZE": warehouse.constants.MAX_PROJECT_SIZE,
+            "ONE_GIB": views.ONE_GIB,
             "UPLOAD_LIMIT_CAP": views.UPLOAD_LIMIT_CAP,
+            "observation_kinds": ObservationKind,
+            "observations": [],
         }
 
     def test_non_normalized_name(self, db_request):
@@ -117,10 +128,9 @@ class TestReleaseDetail:
         project = ProjectFactory.create()
         release = ReleaseFactory.create(project=project)
         journals = sorted(
-            [
-                JournalEntryFactory(name=project.name, version=release.version)
-                for _ in range(3)
-            ],
+            JournalEntryFactory.create_batch(
+                3, name=project.name, version=release.version
+            ),
             key=lambda x: (x.submitted_date, x.id),
             reverse=True,
         )
@@ -128,14 +138,139 @@ class TestReleaseDetail:
         assert views.release_detail(release, db_request) == {
             "release": release,
             "journals": journals,
+            "observation_kinds": ObservationKind,
+            "observations": [],
         }
+
+    def test_release_render(self, db_request):
+        project = ProjectFactory.create()
+        release = ReleaseFactory.create(project=project)
+        db_request.matchdict["project_name"] = str(project.normalized_name)
+        db_request.matchdict["version"] = str(release.version)
+        db_request.route_path = pretend.call_recorder(
+            lambda *a, **kw: "/admin/projects/"
+        )
+        db_request.session = pretend.stub(
+            flash=pretend.call_recorder(lambda *a, **kw: None)
+        )
+        db_request.user = UserFactory.create()
+        # Mock request task handler
+        request_task_mock = mock.Mock()
+        db_request.task = request_task_mock
+
+        views.release_render(release, db_request)
+
+        request_task_mock.assert_called_with(update_release_description)
+
+        assert db_request.session.flash.calls == [
+            pretend.call(
+                f"Task sent to re-render description for {release}", queue="success"
+            )
+        ]
+
+
+class TestReleaseAddObservation:
+    def test_add_observation(self, db_request):
+        release = ReleaseFactory.create()
+        user = UserFactory.create()
+        db_request.route_path = pretend.call_recorder(
+            lambda *a, **kw: "/admin/projects/"
+        )
+        db_request.matchdict["project_name"] = release.project.normalized_name
+        db_request.POST["kind"] = ObservationKind.IsSpam.value[0]
+        db_request.POST["summary"] = "This is a summary"
+        db_request.user = user
+
+        views.add_release_observation(release, db_request)
+
+        assert len(release.observations) == 1
+
+    def test_no_kind_errors(self):
+        release = pretend.stub(
+            project=pretend.stub(name="foo", normalized_name="foo"), version="1.0"
+        )
+        request = pretend.stub(
+            POST={},
+            session=pretend.stub(flash=pretend.call_recorder(lambda *a, **kw: None)),
+            route_path=lambda *a, **kw: "/foo/bar/",
+        )
+
+        with pytest.raises(HTTPSeeOther) as exc:
+            views.add_release_observation(release, request)
+        assert exc.value.status_code == 303
+        assert exc.value.headers["Location"] == "/foo/bar/"
+
+        assert request.session.flash.calls == [
+            pretend.call("Provide a kind", queue="error")
+        ]
+
+    def test_invalid_kind_errors(self):
+        release = pretend.stub(
+            project=pretend.stub(name="foo", normalized_name="foo"), version="1.0"
+        )
+        request = pretend.stub(
+            POST={"kind": "not a valid kind"},
+            session=pretend.stub(flash=pretend.call_recorder(lambda *a, **kw: None)),
+            route_path=lambda *a, **kw: "/foo/bar/",
+        )
+
+        with pytest.raises(HTTPSeeOther) as exc:
+            views.add_release_observation(release, request)
+        assert exc.value.status_code == 303
+        assert exc.value.headers["Location"] == "/foo/bar/"
+
+        assert request.session.flash.calls == [
+            pretend.call("Invalid kind", queue="error")
+        ]
+
+    def test_no_summary_errors(self):
+        release = pretend.stub(
+            project=pretend.stub(name="foo", normalized_name="foo"), version="1.0"
+        )
+        request = pretend.stub(
+            POST={"kind": ObservationKind.IsSpam.value[0]},
+            session=pretend.stub(flash=pretend.call_recorder(lambda *a, **kw: None)),
+            route_path=lambda *a, **kw: "/foo/bar/",
+        )
+
+        with pytest.raises(HTTPSeeOther) as exc:
+            views.add_release_observation(release, request)
+        assert exc.value.status_code == 303
+        assert exc.value.headers["Location"] == "/foo/bar/"
+
+        assert request.session.flash.calls == [
+            pretend.call("Provide a summary", queue="error")
+        ]
+
+
+class TestProjectQuarantine:
+    def test_remove_from_quarantine(self, db_request):
+        project = ProjectFactory.create(lifecycle_status="quarantine-enter")
+        db_request.route_path = pretend.call_recorder(
+            lambda *a, **kw: "/admin/projects/"
+        )
+        db_request.session = pretend.stub(
+            flash=pretend.call_recorder(lambda *a, **kw: None)
+        )
+        db_request.user = UserFactory.create()
+        db_request.matchdict["project_name"] = project.normalized_name
+
+        views.remove_from_quarantine(project, db_request)
+
+        assert db_request.session.flash.calls == [
+            pretend.call(
+                f"Project {project.name} quarantine cleared.\n"
+                "Please update related Help Scout conversations.",
+                queue="success",
+            )
+        ]
 
 
 class TestProjectReleasesList:
     def test_no_query(self, db_request):
         project = ProjectFactory.create()
         releases = sorted(
-            [ReleaseFactory.create(project=project) for _ in range(30)],
+            ReleaseFactory.create_batch(30, project=project),
             key=lambda x: x._pypi_ordering,
             reverse=True,
         )
@@ -147,7 +282,7 @@ class TestProjectReleasesList:
     def test_with_page(self, db_request):
         project = ProjectFactory.create()
         releases = sorted(
-            [ReleaseFactory.create(project=project) for _ in range(30)],
+            ReleaseFactory.create_batch(30, project=project),
             key=lambda x: x._pypi_ordering,
             reverse=True,
         )
@@ -168,7 +303,7 @@ class TestProjectReleasesList:
     def test_version_query(self, db_request):
         project = ProjectFactory.create()
         releases = sorted(
-            [ReleaseFactory.create(project=project) for _ in range(30)],
+            ReleaseFactory.create_batch(30, project=project),
             key=lambda x: x._pypi_ordering,
             reverse=True,
         )
@@ -185,7 +320,7 @@ class TestProjectReleasesList:
     def test_invalid_key_query(self, db_request):
         project = ProjectFactory.create()
         releases = sorted(
-            [ReleaseFactory.create(project=project) for _ in range(30)],
+            ReleaseFactory.create_batch(30, project=project),
             key=lambda x: x._pypi_ordering,
             reverse=True,
         )
@@ -202,7 +337,7 @@ class TestProjectReleasesList:
     def test_basic_query(self, db_request):
         project = ProjectFactory.create()
         releases = sorted(
-            [ReleaseFactory.create(project=project) for _ in range(30)],
+            ReleaseFactory.create_batch(30, project=project),
             key=lambda x: x._pypi_ordering,
             reverse=True,
         )
@@ -230,7 +365,7 @@ class TestProjectJournalsList:
     def test_no_query(self, db_request):
         project = ProjectFactory.create()
         journals = sorted(
-            [JournalEntryFactory(name=project.name) for _ in range(30)],
+            JournalEntryFactory.create_batch(30, name=project.name),
             key=lambda x: (x.submitted_date, x.id),
             reverse=True,
         )
@@ -242,7 +377,7 @@ class TestProjectJournalsList:
     def test_with_page(self, db_request):
         project = ProjectFactory.create()
         journals = sorted(
-            [JournalEntryFactory(name=project.name) for _ in range(30)],
+            JournalEntryFactory.create_batch(30, name=project.name),
             key=lambda x: (x.submitted_date, x.id),
             reverse=True,
         )
@@ -263,7 +398,7 @@ class TestProjectJournalsList:
     def test_version_query(self, db_request):
         project = ProjectFactory.create()
         journals = sorted(
-            [JournalEntryFactory(name=project.name) for _ in range(30)],
+            JournalEntryFactory.create_batch(30, name=project.name),
             key=lambda x: (x.submitted_date, x.id),
             reverse=True,
         )
@@ -280,7 +415,7 @@ class TestProjectJournalsList:
     def test_invalid_key_query(self, db_request):
         project = ProjectFactory.create()
         journals = sorted(
-            [JournalEntryFactory(name=project.name) for _ in range(30)],
+            JournalEntryFactory.create_batch(30, name=project.name),
             key=lambda x: (x.submitted_date, x.id),
             reverse=True,
         )
@@ -297,7 +432,7 @@ class TestProjectJournalsList:
     def test_basic_query(self, db_request):
         project = ProjectFactory.create()
         journals = sorted(
-            [JournalEntryFactory(name=project.name) for _ in range(30)],
+            JournalEntryFactory.create_batch(30, name=project.name),
             key=lambda x: (x.submitted_date, x.id),
             reverse=True,
         )
@@ -321,6 +456,131 @@ class TestProjectJournalsList:
             views.journals_list(project, db_request)
 
 
+class TestProjectObservationsList:
+    def test_with_page(self, db_request):
+        observer = ObserverFactory.create()
+        UserFactory.create(observer=observer)
+        project = ProjectFactory.create()
+        ProjectObservationFactory.create_batch(
+            size=30, related=project, observer=observer
+        )
+
+        observations_query = (
+            db_request.db.query(project.Observation)
+            .options(joinedload(project.Observation.observer))
+            .filter(project.Observation.related == project)
+            .order_by(project.Observation.created.desc())
+        )
+        observations_page = SqlalchemyOrmPage(
+            observations_query,
+            page=2,
+            items_per_page=25,
+            url_maker=paginate_url_factory(db_request),
+        )
+
+        db_request.matchdict["project_name"] = project.normalized_name
+        db_request.GET["page"] = "2"
+        result = views.project_observations_list(project, db_request)
+
+        assert result == {
+            "observations": observations_page,
+            "project": project,
+        }
+        assert len(observations_page.items) == 5
+
+    def test_with_invalid_page(self, db_request):
+        project = ProjectFactory.create()
+        db_request.matchdict["project_name"] = project.normalized_name
+        db_request.GET["page"] = "not an integer"
+
+        with pytest.raises(HTTPBadRequest):
+            views.project_observations_list(project, db_request)
+
+
+class TestProjectAddObservation:
+    def test_add_observation(self, db_request):
+        project = ProjectFactory.create()
+        observer = ObserverFactory.create()
+        user = UserFactory.create(observer=observer)
+        db_request.route_path = pretend.call_recorder(
+            lambda *a, **kw: "/admin/projects/"
+        )
+        db_request.matchdict["project_name"] = project.normalized_name
+        db_request.POST["kind"] = ObservationKind.IsSpam.value[0]
+        db_request.POST["summary"] = "This is a summary"
+        db_request.user = user
+
+        views.add_project_observation(project, db_request)
+
+        assert len(project.observations) == 1
+
+    def test_no_user_observer(self, db_request):
+        project = ProjectFactory.create()
+        user = UserFactory.create()
+        db_request.route_path = pretend.call_recorder(
+            lambda *a, **kw: "/admin/projects/"
+        )
+        db_request.matchdict["project_name"] = project.normalized_name
+        db_request.POST["kind"] = ObservationKind.IsSpam.value[0]
+        db_request.POST["summary"] = "This is a summary"
+        db_request.user = user
+
+        views.add_project_observation(project, db_request)
+
+        assert len(project.observations) == 1
+
+    def test_no_kind_errors(self):
+        project = pretend.stub(name="foo", normalized_name="foo")
+        request = pretend.stub(
+            POST={},
+            session=pretend.stub(flash=pretend.call_recorder(lambda *a, **kw: None)),
+            route_path=lambda *a, **kw: "/foo/bar/",
+        )
+
+        with pytest.raises(HTTPSeeOther) as exc:
+            views.add_project_observation(project, request)
+        assert exc.value.status_code == 303
+        assert exc.value.headers["Location"] == "/foo/bar/"
+
+        assert request.session.flash.calls == [
+            pretend.call("Provide a kind", queue="error")
+        ]
+
+    def test_invalid_kind_errors(self):
+        project = pretend.stub(name="foo", normalized_name="foo")
+        request = pretend.stub(
+            POST={"kind": "not a valid kind"},
+            session=pretend.stub(flash=pretend.call_recorder(lambda *a, **kw: None)),
+            route_path=lambda *a, **kw: "/foo/bar/",
+        )
+
+        with pytest.raises(HTTPSeeOther) as exc:
+            views.add_project_observation(project, request)
+        assert exc.value.status_code == 303
+        assert exc.value.headers["Location"] == "/foo/bar/"
+
+        assert request.session.flash.calls == [
+            pretend.call("Invalid kind", queue="error")
+        ]
+
+    def test_no_summary_errors(self):
+        project = pretend.stub(name="foo", normalized_name="foo")
+        request = pretend.stub(
+            POST={"kind": ObservationKind.IsSpam.value[0]},
+            session=pretend.stub(flash=pretend.call_recorder(lambda *a, **kw: None)),
+            route_path=lambda *a, **kw: "/foo/bar/",
+        )
+
+        with pytest.raises(HTTPSeeOther) as exc:
+            views.add_project_observation(project, request)
+        assert exc.value.status_code == 303
+        assert exc.value.headers["Location"] == "/foo/bar/"
+
+        assert request.session.flash.calls == [
+            pretend.call("Provide a summary", queue="error")
+        ]
+
+
 class TestProjectSetTotalSizeLimit:
     def test_sets_total_size_limitwith_integer(self, db_request):
         project = ProjectFactory.create(name="foo")
@@ -340,11 +600,11 @@ class TestProjectSetTotalSizeLimit:
             pretend.call("Set the total size limit on 'foo'", queue="success")
         ]
 
-        assert project.total_size_limit == 150 * views.ONE_GB
+        assert project.total_size_limit == 150 * views.ONE_GIB
 
     def test_sets_total_size_limitwith_none(self, db_request):
         project = ProjectFactory.create(name="foo")
-        project.total_size_limit = 150 * views.ONE_GB
+        project.total_size_limit = 150 * views.ONE_GIB
 
         db_request.route_path = pretend.call_recorder(
             lambda *a, **kw: "/admin/projects/"
@@ -392,7 +652,7 @@ class TestProjectSetLimit:
             flash=pretend.call_recorder(lambda *a, **kw: None)
         )
         db_request.matchdict["project_name"] = project.normalized_name
-        new_upload_limit = views.MAX_FILESIZE // views.ONE_MB
+        new_upload_limit = warehouse.constants.MAX_FILESIZE // views.ONE_MIB
         db_request.POST["upload_limit"] = str(new_upload_limit)
 
         views.set_upload_limit(project, db_request)
@@ -401,11 +661,11 @@ class TestProjectSetLimit:
             pretend.call("Set the upload limit on 'foo'", queue="success")
         ]
 
-        assert project.upload_limit == new_upload_limit * views.ONE_MB
+        assert project.upload_limit == new_upload_limit * views.ONE_MIB
 
     def test_sets_limit_with_none(self, db_request):
         project = ProjectFactory.create(name="foo")
-        project.upload_limit = 90 * views.ONE_MB
+        project.upload_limit = 90 * views.ONE_MIB
 
         db_request.route_path = pretend.call_recorder(
             lambda *a, **kw: "/admin/projects/"
@@ -462,8 +722,8 @@ class TestDeleteProject:
 
         with pytest.raises(HTTPSeeOther) as exc:
             views.delete_project(project, request)
-            assert exc.value.status_code == 303
-            assert exc.value.headers["Location"] == "/foo/bar/"
+        assert exc.value.status_code == 303
+        assert exc.value.headers["Location"] == "/foo/bar/"
 
         assert request.session.flash.calls == [
             pretend.call("Confirm the request", queue="error")
@@ -479,8 +739,8 @@ class TestDeleteProject:
 
         with pytest.raises(HTTPSeeOther) as exc:
             views.delete_project(project, request)
-            assert exc.value.status_code == 303
-            assert exc.value.headers["Location"] == "/foo/bar/"
+        assert exc.value.status_code == 303
+        assert exc.value.headers["Location"] == "/foo/bar/"
 
         assert request.session.flash.calls == [
             pretend.call(
@@ -514,6 +774,7 @@ class TestAddRole:
     def test_add_role(self, db_request):
         role_name = "Maintainer"
         project = ProjectFactory.create(name="foo")
+        UserFactory.create(username="admin")
         user = UserFactory.create(username="bar")
 
         db_request.route_path = pretend.call_recorder(lambda *a, **kw: "/the-redirect/")
@@ -608,6 +869,7 @@ class TestDeleteRole:
         project = ProjectFactory.create(name="foo")
         user = UserFactory.create(username="bar")
         role = RoleFactory.create(project=project, user=user)
+        UserFactory.create(username="admin")
 
         db_request.route_path = pretend.call_recorder(lambda *a, **kw: "/the-redirect/")
         db_request.session = pretend.stub(

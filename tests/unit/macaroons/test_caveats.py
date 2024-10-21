@@ -19,6 +19,8 @@ import pytest
 from pydantic.dataclasses import dataclass
 from pymacaroons import Macaroon
 
+from warehouse.accounts import _oidc_publisher
+from warehouse.accounts.utils import UserContext
 from warehouse.macaroons import caveats
 from warehouse.macaroons.caveats import (
     Caveat,
@@ -35,6 +37,7 @@ from warehouse.macaroons.caveats import (
     verify,
 )
 from warehouse.macaroons.caveats._core import _CaveatRegistry
+from warehouse.oidc.utils import PublisherTokenContext
 
 from ...common.db.accounts import UserFactory
 from ...common.db.oidc import GitHubPublisherFactory
@@ -60,7 +63,7 @@ def test_caveat_verify_fails():
 
 
 @pytest.mark.parametrize(
-    "caveat,expected",
+    ("caveat", "expected"),
     [
         (Expiration(expires_at=50, not_before=10), b"[0,50,10]"),
         (ProjectName(normalized_names=["foo", "bar"]), b'[1,["foo","bar"]]'),
@@ -75,9 +78,29 @@ def test_serialization(caveat, expected):
     assert serialize(caveat) == expected
 
 
+@pytest.mark.parametrize(
+    ("caveat", "expected"),
+    [
+        (Expiration(expires_at=50, not_before=10), [[0, 50, 10]]),
+        (ProjectName(normalized_names=["foo", "bar"]), [[1, ["foo", "bar"]]]),
+        (
+            ProjectID(project_ids=["123uuid", "456uuid"]),
+            [[2, ["123uuid", "456uuid"]]],
+        ),
+        (RequestUser(user_id="a uuid"), [[3, "a uuid"]]),
+    ],
+)
+def test_serialization_onto_events(caveat, expected, db_request):
+    user = UserFactory()
+    user.record_event(
+        tag="foobar", request=db_request, additional={"caveats": [caveat]}
+    )
+    assert user.events[0].additional["caveats"] == expected
+
+
 class TestDeserialization:
     @pytest.mark.parametrize(
-        "data,expected",
+        ("data", "expected"),
         [
             # Current Caveat Style
             (b"[0,50,10]", Expiration(expires_at=50, not_before=10)),
@@ -87,6 +110,10 @@ class TestDeserialization:
                 ProjectID(project_ids=["123uuid", "456uuid"]),
             ),
             (b'[3,"a uuid"]', RequestUser(user_id="a uuid")),
+            (
+                b'[4,"somepublisher"]',
+                OIDCPublisher(oidc_publisher_id="somepublisher"),
+            ),
             # Legacy Caveat Style
             (b'{"exp": 50, "nbf": 10}', Expiration(expires_at=50, not_before=10)),
             (
@@ -244,7 +271,7 @@ class TestRequestUserCaveat:
 
         assert result == Failure("token with user restriction without a user")
 
-    def test_verify_invalid_identity(self):
+    def test_verify_invalid_identity_no_user(self):
         caveat = RequestUser(user_id="invalid")
         result = caveat.verify(
             pretend.stub(identity=pretend.stub()), pretend.stub(), pretend.stub()
@@ -252,12 +279,24 @@ class TestRequestUserCaveat:
 
         assert result == Failure("token with user restriction without a user")
 
+    def test_verify_invalid_identity_no_macaroon(self, db_request):
+        user = UserFactory.create()
+        user_context = UserContext(user, None)
+
+        caveat = RequestUser(user_id=str(user.id))
+        result = caveat.verify(
+            pretend.stub(identity=user_context), pretend.stub(), pretend.stub()
+        )
+
+        assert result == Failure("token with user restriction without a macaroon")
+
     def test_verify_invalid_user_id(self, db_request):
         user = UserFactory.create()
+        user_context = UserContext(user, pretend.stub())
 
         caveat = RequestUser(user_id="invalid")
         result = caveat.verify(
-            pretend.stub(identity=user), pretend.stub(), pretend.stub()
+            pretend.stub(identity=user_context), pretend.stub(), pretend.stub()
         )
 
         assert result == Failure(
@@ -266,10 +305,11 @@ class TestRequestUserCaveat:
 
     def test_verify_ok(self, db_request):
         user = UserFactory.create()
+        user_context = UserContext(user, pretend.stub())
 
         caveat = RequestUser(user_id=str(user.id))
         result = caveat.verify(
-            pretend.stub(identity=user), pretend.stub(), pretend.stub()
+            pretend.stub(identity=user_context), pretend.stub(), pretend.stub()
         )
 
         assert result == Success()
@@ -279,7 +319,9 @@ class TestOIDCPublisherCaveat:
     def test_verify_no_identity(self):
         caveat = OIDCPublisher(oidc_publisher_id="invalid")
         result = caveat.verify(
-            pretend.stub(identity=None), pretend.stub(), pretend.stub()
+            pretend.stub(identity=None, oidc_publisher=None),
+            pretend.stub(),
+            pretend.stub(),
         )
 
         assert result == Failure(
@@ -287,24 +329,24 @@ class TestOIDCPublisherCaveat:
         )
 
     def test_verify_invalid_publisher_id(self, db_request):
-        publisher = GitHubPublisherFactory.create()
+        identity = PublisherTokenContext(GitHubPublisherFactory.create(), None)
+        request = pretend.stub(identity=identity)
+        request.oidc_publisher = _oidc_publisher(request)
 
         caveat = OIDCPublisher(oidc_publisher_id="invalid")
-        result = caveat.verify(
-            pretend.stub(identity=publisher), pretend.stub(), pretend.stub()
-        )
+        result = caveat.verify(request, pretend.stub(), pretend.stub())
 
         assert result == Failure(
             "current OIDC publisher does not match publisher restriction in token"
         )
 
     def test_verify_invalid_context(self, db_request):
-        publisher = GitHubPublisherFactory.create()
+        identity = PublisherTokenContext(GitHubPublisherFactory.create(), None)
+        request = pretend.stub(identity=identity)
+        request.oidc_publisher = _oidc_publisher(request)
 
-        caveat = OIDCPublisher(oidc_publisher_id=str(publisher.id))
-        result = caveat.verify(
-            pretend.stub(identity=publisher), pretend.stub(), pretend.stub()
-        )
+        caveat = OIDCPublisher(oidc_publisher_id=str(request.oidc_publisher.id))
+        result = caveat.verify(request, pretend.stub(), pretend.stub())
 
         assert result == Failure("OIDC scoped token used outside of a project context")
 
@@ -314,10 +356,14 @@ class TestOIDCPublisherCaveat:
 
         # This OIDC publisher is only registered to "foobar", so it should
         # not verify a caveat presented for "foobaz".
-        publisher = GitHubPublisherFactory.create(projects=[foobar])
-        caveat = OIDCPublisher(oidc_publisher_id=str(publisher.id))
+        identity = PublisherTokenContext(
+            GitHubPublisherFactory.create(projects=[foobar]), None
+        )
+        request = pretend.stub(identity=identity)
+        request.oidc_publisher = _oidc_publisher(request)
+        caveat = OIDCPublisher(oidc_publisher_id=str(request.oidc_publisher.id))
 
-        result = caveat.verify(pretend.stub(identity=publisher), foobaz, pretend.stub())
+        result = caveat.verify(request, foobaz, pretend.stub())
 
         assert result == Failure("OIDC scoped token is not valid for project 'foobaz'")
 
@@ -326,10 +372,14 @@ class TestOIDCPublisherCaveat:
 
         # This OIDC publisher is only registered to "foobar", so it should
         # not verify a caveat presented for "foobaz".
-        publisher = GitHubPublisherFactory.create(projects=[foobar])
-        caveat = OIDCPublisher(oidc_publisher_id=str(publisher.id))
+        identity = PublisherTokenContext(
+            GitHubPublisherFactory.create(projects=[foobar]), None
+        )
+        request = pretend.stub(identity=identity)
+        request.oidc_publisher = _oidc_publisher(request)
+        caveat = OIDCPublisher(oidc_publisher_id=str(request.oidc_publisher.id))
 
-        result = caveat.verify(pretend.stub(identity=publisher), foobar, pretend.stub())
+        result = caveat.verify(request, foobar, pretend.stub())
 
         assert result == Success()
 

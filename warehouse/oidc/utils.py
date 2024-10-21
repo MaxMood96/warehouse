@@ -12,16 +12,68 @@
 
 from __future__ import annotations
 
-from sqlalchemy.sql.expression import func, literal
+from dataclasses import dataclass
 
-from warehouse.oidc.models import GitHubPublisher, PendingGitHubPublisher
+from pyramid.authorization import Authenticated
+
+from warehouse.admin.flags import AdminFlagValue
+from warehouse.oidc.errors import InvalidPublisherError
+from warehouse.oidc.interfaces import SignedClaims
+from warehouse.oidc.models import (
+    ActiveStatePublisher,
+    GitHubPublisher,
+    GitLabPublisher,
+    GooglePublisher,
+    OIDCPublisher,
+    PendingActiveStatePublisher,
+    PendingGitHubPublisher,
+    PendingGitLabPublisher,
+    PendingGooglePublisher,
+    PendingOIDCPublisher,
+)
 
 GITHUB_OIDC_ISSUER_URL = "https://token.actions.githubusercontent.com"
+GITLAB_OIDC_ISSUER_URL = "https://gitlab.com"
+GOOGLE_OIDC_ISSUER_URL = "https://accounts.google.com"
+ACTIVESTATE_OIDC_ISSUER_URL = "https://platform.activestate.com/api/v1/oauth/oidc"
 
-OIDC_ISSUER_URLS = {GITHUB_OIDC_ISSUER_URL}
+OIDC_ISSUER_SERVICE_NAMES = {
+    GITHUB_OIDC_ISSUER_URL: "github",
+    GITLAB_OIDC_ISSUER_URL: "gitlab",
+    GOOGLE_OIDC_ISSUER_URL: "google",
+    ACTIVESTATE_OIDC_ISSUER_URL: "activestate",
+}
+
+OIDC_ISSUER_ADMIN_FLAGS = {
+    GITHUB_OIDC_ISSUER_URL: AdminFlagValue.DISALLOW_GITHUB_OIDC,
+    GITLAB_OIDC_ISSUER_URL: AdminFlagValue.DISALLOW_GITLAB_OIDC,
+    GOOGLE_OIDC_ISSUER_URL: AdminFlagValue.DISALLOW_GOOGLE_OIDC,
+    ACTIVESTATE_OIDC_ISSUER_URL: AdminFlagValue.DISALLOW_ACTIVESTATE_OIDC,
+}
+
+OIDC_ISSUER_URLS = {
+    GITHUB_OIDC_ISSUER_URL,
+    GITLAB_OIDC_ISSUER_URL,
+    GOOGLE_OIDC_ISSUER_URL,
+    ACTIVESTATE_OIDC_ISSUER_URL,
+}
+
+OIDC_PUBLISHER_CLASSES: dict[
+    str, dict[bool, type[OIDCPublisher | PendingOIDCPublisher]]
+] = {
+    GITHUB_OIDC_ISSUER_URL: {False: GitHubPublisher, True: PendingGitHubPublisher},
+    GITLAB_OIDC_ISSUER_URL: {False: GitLabPublisher, True: PendingGitLabPublisher},
+    GOOGLE_OIDC_ISSUER_URL: {False: GooglePublisher, True: PendingGooglePublisher},
+    ACTIVESTATE_OIDC_ISSUER_URL: {
+        False: ActiveStatePublisher,
+        True: PendingActiveStatePublisher,
+    },
+}
 
 
-def find_publisher_by_issuer(session, issuer_url, signed_claims, *, pending=False):
+def find_publisher_by_issuer(
+    session, issuer_url: str, signed_claims: SignedClaims, *, pending: bool = False
+) -> OIDCPublisher | PendingOIDCPublisher:
     """
     Given an OIDC issuer URL and a dictionary of claims that have been verified
     for a token from that OIDC issuer, retrieve either an `OIDCPublisher` registered
@@ -31,36 +83,41 @@ def find_publisher_by_issuer(session, issuer_url, signed_claims, *, pending=Fals
     Returns `None` if no publisher can be found.
     """
 
-    if issuer_url not in OIDC_ISSUER_URLS:
+    try:
+        publisher_cls = OIDC_PUBLISHER_CLASSES[issuer_url][pending]
+    except KeyError:
         # This indicates a logic error, since we shouldn't have verified
         # claims for an issuer that we don't recognize and support.
-        return None
+        raise InvalidPublisherError(f"Issuer {issuer_url!r} is unsupported")
 
-    # This is the ugly part: OIDCPublisher and PendingOIDCPublisher are both
-    # polymorphic, and retrieving the correct publisher requires us to query
-    # based on publisher-specific claims.
-    if issuer_url == GITHUB_OIDC_ISSUER_URL:
-        repository = signed_claims["repository"]
-        repository_owner, repository_name = repository.split("/", 1)
-        workflow_prefix = f"{repository}/.github/workflows/"
-        workflow_ref = signed_claims["job_workflow_ref"].removeprefix(workflow_prefix)
+    # Before looking up the publisher by claims, we need to ensure that all expected
+    # claims are present in the JWT.
+    publisher_cls.check_claims_existence(signed_claims)
 
-        publisher_cls = GitHubPublisher if not pending else PendingGitHubPublisher
+    return publisher_cls.lookup_by_claims(session, signed_claims)
 
-        return (
-            session.query(publisher_cls)
-            .filter_by(
-                repository_name=repository_name,
-                repository_owner=repository_owner,
-                repository_owner_id=signed_claims["repository_owner_id"],
-            )
-            .filter(
-                literal(workflow_ref).like(
-                    func.concat(publisher_cls.workflow_filename, "%")
-                )
-            )
-            .one_or_none()
-        )
-    else:
-        # Unreachable; same logic error as above.
-        return None  # pragma: no cover
+
+@dataclass
+class PublisherTokenContext:
+    """
+    This class supports `MacaroonSecurityPolicy` in
+    `warehouse.macaroons.security_policy`.
+
+    It is a wrapper containing both the signed claims associated with an OIDC
+    authenticated request and its `OIDCPublisher` DB model. We use it to smuggle
+    claims from the identity provider through to a session. `request.identity`
+    in an OIDC authenticated request should return this type.
+    """
+
+    publisher: OIDCPublisher
+    """
+    The associated OIDC publisher.
+    """
+
+    claims: SignedClaims | None
+    """
+    Pertinent OIDC claims from the token, if they exist.
+    """
+
+    def __principals__(self) -> list[str]:
+        return [Authenticated, f"oidc:{self.publisher.id}"]

@@ -10,25 +10,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import enum
 import functools
 import logging
 
+from uuid import UUID
+
 import alembic.config
+import psycopg.types.json
 import pyramid_retry
 import sqlalchemy
 import venusian
 import zope.sqlalchemy
 
-from sqlalchemy import event, inspect
-from sqlalchemy.dialects.postgresql import UUID
+from pyramid.renderers import JSON
+from sqlalchemy import event, func, inspect
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.exc import IntegrityError, OperationalError
-from sqlalchemy.ext.declarative import declarative_base  # type: ignore
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 from warehouse.metrics import IMetricsService
 from warehouse.utils.attrs import make_repr
 
-__all__ = ["includeme", "metadata", "ModelBase"]
+__all__ = ["includeme", "metadata", "ModelBase", "Model"]
 
 
 logger = logging.getLogger(__name__)
@@ -60,11 +64,26 @@ pyramid_retry.mark_error_retryable(IntegrityError)
 
 # A generic wrapper exception that we'll raise when the database isn't available, we
 # use this so we can catch it later and turn it into a generic 5xx error.
-class DatabaseNotAvailableError(Exception):
-    ...
+class DatabaseNotAvailableError(Exception): ...
 
 
-class ModelBase:
+# The Global metadata object.
+metadata = sqlalchemy.MetaData()
+
+
+class ModelBase(DeclarativeBase):
+    """Base class for models using declarative syntax."""
+
+    metadata = metadata
+
+    type_annotation_map = {
+        # All of our enums prefer the `.value` for database persistence
+        # instead of `.name`, which is the default.
+        enum.Enum: sqlalchemy.Enum(
+            enum.Enum, values_callable=lambda x: [e.value for e in x]
+        ),
+    }
+
     def __repr__(self):
         inst = inspect(self)
         self.__repr__ = make_repr(
@@ -73,22 +92,13 @@ class ModelBase:
         return self.__repr__()
 
 
-# The Global metadata object.
-metadata = sqlalchemy.MetaData()
-
-
-# Base class for models using declarative syntax
-ModelBase = declarative_base(cls=ModelBase, metadata=metadata)  # type: ignore
-
-
 class Model(ModelBase):
-
     __abstract__ = True
 
-    id = sqlalchemy.Column(
-        UUID(as_uuid=True),
+    id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
         primary_key=True,
-        server_default=sqlalchemy.text("gen_random_uuid()"),
+        server_default=func.gen_random_uuid(),
     )
 
 
@@ -156,7 +166,7 @@ def _create_session(request):
     # Check if we're in read-only mode
     from warehouse.admin.flags import AdminFlag, AdminFlagValue
 
-    flag = session.query(AdminFlag).get(AdminFlagValue.READ_ONLY.value)
+    flag = session.get(AdminFlag, AdminFlagValue.READ_ONLY.value)
     if flag and flag.enabled:
         request.tm.doom()
 
@@ -177,5 +187,18 @@ def includeme(config):
         pool_timeout=20,
     )
 
-    # Register our request.db property
-    config.add_request_method(_create_session, name="db", reify=True)
+    # Possibly override how to fetch new db sessions from config.settings
+    #  Useful in test fixtures
+    db_session_factory = config.registry.settings.get(
+        "warehouse.db_create_session", _create_session
+    )
+    config.add_request_method(db_session_factory, name="db", reify=True)
+
+    # Set a custom JSON serializer for psycopg
+    renderer = JSON()
+    renderer_factory = renderer(None)
+
+    def serialize_as_json(obj):
+        return renderer_factory(obj, {})
+
+    psycopg.types.json.set_json_dumps(serialize_as_json)

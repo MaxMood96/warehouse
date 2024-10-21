@@ -37,7 +37,7 @@ class TestProhibitedProjectNameList:
     def test_no_query(self, db_request):
         db_request.db.query(ProhibitedProjectName).delete()
         prohibited = sorted(
-            [ProhibitedProjectFactory.create() for _ in range(30)],
+            ProhibitedProjectFactory.create_batch(30),
             key=lambda b: canonicalize_name(b.name),
         )
         result = views.prohibited_project_names(db_request)
@@ -47,7 +47,7 @@ class TestProhibitedProjectNameList:
     def test_with_page(self, db_request):
         db_request.db.query(ProhibitedProjectName).delete()
         prohibited = sorted(
-            [ProhibitedProjectFactory.create() for _ in range(30)],
+            ProhibitedProjectFactory.create_batch(30),
             key=lambda b: canonicalize_name(b.name),
         )
         db_request.GET["page"] = "2"
@@ -64,7 +64,7 @@ class TestProhibitedProjectNameList:
     def test_basic_query(self, db_request):
         db_request.db.query(ProhibitedProjectName).delete()
         prohibited = sorted(
-            [ProhibitedProjectFactory.create() for _ in range(30)],
+            ProhibitedProjectFactory.create_batch(30),
             key=lambda b: canonicalize_name(b.name),
         )
         db_request.GET["q"] = prohibited[0].name
@@ -78,7 +78,7 @@ class TestProhibitedProjectNameList:
     def test_wildcard_query(self, db_request):
         db_request.db.query(ProhibitedProjectName).delete()
         prohibited = sorted(
-            [ProhibitedProjectFactory.create() for _ in range(30)],
+            ProhibitedProjectFactory.create_batch(30),
             key=lambda b: canonicalize_name(b.name),
         )
         db_request.GET["q"] = prohibited[0].name[:-1] + "%"
@@ -174,7 +174,7 @@ class TestAddProhibitedProjectName:
         assert result.headers["Location"] == "/foo/bar/"
 
     @pytest.mark.parametrize(
-        "project_name, prohibit_name",
+        ("project_name", "prohibit_name"),
         [
             ("foobar", "foobar"),
             ("FoObAr", "fOoBaR"),

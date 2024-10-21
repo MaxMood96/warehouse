@@ -21,7 +21,7 @@ from pymacaroons.exceptions import MacaroonInvalidSignatureException
 from pyramid.request import Request
 from pyramid.security import Allowed
 
-from warehouse.accounts.models import User
+from warehouse.accounts.utils import UserContext
 from warehouse.errors import WarehouseDenied
 from warehouse.macaroons.caveats._core import (
     Caveat,
@@ -31,12 +31,24 @@ from warehouse.macaroons.caveats._core import (
     Success,
     as_caveat,
     deserialize,
+    deserialize_obj,
     serialize,
+    serialize_obj,
 )
-from warehouse.oidc import models as oidc_models
+from warehouse.oidc.interfaces import SignedClaims
 from warehouse.packaging.models import Project
 
-__all__ = ["deserialize", "serialize", "verify"]
+__all__ = ["deserialize", "deserialize_obj", "serialize", "serialize_obj", "verify"]
+
+
+# NOTE: Under the covers, caveat serialization is done as an array
+# of `[TAG, ... fields]`, where the order of `fields` is the order of
+# definition in each caveat class.
+#
+# This means that fields cannot be reordered or deleted, and that new
+# fields *must* be added at the end of the class. New fields *must* also
+# include a default value. If a change can't be made under these constraints,
+# then a new Caveat class (and tag) should be created instead.
 
 
 @as_caveat(tag=0)
@@ -92,10 +104,13 @@ class RequestUser(Caveat):
     user_id: StrictStr
 
     def verify(self, request: Request, context: Any, permission: str) -> Result:
-        if not isinstance(request.identity, User):
+        if not isinstance(request.identity, UserContext):
             return Failure("token with user restriction without a user")
 
-        if str(request.identity.id) != self.user_id:
+        if request.identity.macaroon is None:
+            return Failure("token with user restriction without a macaroon")
+
+        if str(request.identity.user.id) != self.user_id:
             return Failure("current user does not match user restriction in token")
 
         return Success()
@@ -105,16 +120,22 @@ class RequestUser(Caveat):
 @dataclass(frozen=True)
 class OIDCPublisher(Caveat):
     oidc_publisher_id: StrictStr
+    oidc_claims: SignedClaims | None = None
+    """
+    This field is deprecated and should not be used.
+
+    Contains the OIDC claims passed through from token exchange.
+    """
 
     def verify(self, request: Request, context: Any, permission: str) -> Result:
         # If the identity associated with this macaroon is not an OpenID publisher,
         # then it doesn't make sense to restrict it with an `OIDCPublisher` caveat.
-        if not isinstance(request.identity, oidc_models.OIDCPublisher):
+        if not request.oidc_publisher:
             return Failure(
                 "OIDC scoped token used outside of an OIDC identified request"
             )
 
-        if str(request.identity.id) != self.oidc_publisher_id:
+        if str(request.oidc_publisher.id) != self.oidc_publisher_id:
             return Failure(
                 "current OIDC publisher does not match publisher restriction in token"
             )
@@ -125,7 +146,7 @@ class OIDCPublisher(Caveat):
 
         # Specifically, they are only valid against projects that are registered
         # to the current identifying OpenID publisher.
-        if context not in request.identity.projects:
+        if context not in request.oidc_publisher.projects:
             return Failure(
                 f"OIDC scoped token is not valid for project '{context.name}'"
             )

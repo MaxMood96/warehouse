@@ -14,22 +14,24 @@
 import collections
 import re
 
-import elasticsearch
+import opensearchpy
 
 from pyramid.exceptions import PredicateMismatch
 from pyramid.httpexceptions import (
     HTTPBadRequest,
     HTTPException,
+    HTTPForbidden,
     HTTPMovedPermanently,
     HTTPNotFound,
+    HTTPRequestEntityTooLarge,
     HTTPSeeOther,
     HTTPServiceUnavailable,
+    HTTPTooManyRequests,
     exception_response,
 )
 from pyramid.i18n import make_localizer
 from pyramid.interfaces import ITranslationDirectories
 from pyramid.renderers import render_to_response
-from pyramid.response import Response
 from pyramid.view import (
     exception_view_config,
     forbidden_view_config,
@@ -37,9 +39,10 @@ from pyramid.view import (
     view_config,
     view_defaults,
 )
-from sqlalchemy import func
+from sqlalchemy import func, text
 from sqlalchemy.sql import exists, expression
 from trove_classifiers import deprecated_classifiers, sorted_classifiers
+from webob.multidict import MultiDict
 
 from warehouse.accounts import REDIRECT_FIELD_NAME
 from warehouse.accounts.models import User
@@ -56,11 +59,13 @@ from warehouse.packaging.models import (
     Project,
     ProjectFactory,
     Release,
-    release_classifiers,
+    ReleaseClassifiers,
 )
-from warehouse.search.queries import SEARCH_FILTER_ORDER, get_es_query
+from warehouse.rate_limiting import IRateLimiter
+from warehouse.search.queries import SEARCH_FILTER_ORDER, get_opensearch_query
+from warehouse.utils.cors import _CORS_HEADERS
 from warehouse.utils.http import is_safe_url
-from warehouse.utils.paginate import ElasticsearchPage, paginate_url_factory
+from warehouse.utils.paginate import OpenSearchPage, paginate_url_factory
 from warehouse.utils.row_counter import RowCount
 
 JSON_REGEX = r"^/pypi/([^\/]+)\/?([^\/]+)?/json\/?$"
@@ -92,9 +97,12 @@ def httpexception_view(exc, request):
     try:
         # Lightweight version of 404 page for `/simple/`
         if isinstance(exc, HTTPNotFound) and request.path.startswith("/simple/"):
-            response = Response(body="404 Not Found", content_type="text/plain")
+            response = HTTPNotFound(
+                body="404 Not Found",
+                content_type="text/plain",
+            )
         elif isinstance(exc, HTTPNotFound) and json_path.match(request.path):
-            response = Response(
+            response = HTTPNotFound(
                 body='{"message": "Not Found"}',
                 charset="utf-8",
                 content_type="application/json",
@@ -116,6 +124,7 @@ def httpexception_view(exc, request):
     response.headers.extend(
         (k, v) for k, v in exc.headers.items() if k not in response.headers
     )
+    response.headers.extend(_CORS_HEADERS)
 
     return response
 
@@ -125,7 +134,7 @@ def httpexception_view(exc, request):
 def forbidden(exc, request):
     # If the forbidden error is because the user isn't logged in, then we'll
     # redirect them to the log in page.
-    if request.authenticated_userid is None:
+    if request.user is None:
         url = request.route_url(
             "accounts.login", _query={REDIRECT_FIELD_NAME: request.path_qs}
         )
@@ -133,9 +142,25 @@ def forbidden(exc, request):
 
     # Check if the error has a "result" attribute and if it is a WarehouseDenied
     if hasattr(exc, "result") and isinstance(exc.result, WarehouseDenied):
+        # If the forbidden error is because the user does not have a verified
+        # email address, redirect them to their account page for email verification.
+        if exc.result.reason == "unverified_email":
+            request.session.flash(
+                request._(
+                    "You must verify your **primary** email address before you "
+                    "can perform this action."
+                ),
+                queue="error",
+            )
+            url = request.route_url(
+                "manage.unverified-account",
+                _query={REDIRECT_FIELD_NAME: request.path_qs},
+            )
+            return HTTPSeeOther(url)
+
         # If the forbidden error is because the user doesn't have 2FA enabled, we'll
         # redirect them to the 2FA page
-        if exc.result.reason in {"owners_require_2fa", "pypi_mandates_2fa"}:
+        if exc.result.reason == "manage_2fa_required":
             request.session.flash(
                 request._(
                     "Two-factor authentication must be enabled on your account to "
@@ -159,7 +184,18 @@ def forbidden(exc, request):
 def forbidden_include(exc, request):
     # If the forbidden error is for a client-side-include, just return an empty
     # response instead of redirecting
-    return Response(status=403)
+    return HTTPForbidden()
+
+
+@forbidden_view_config(path_info=r"^/(danger-)?api/")
+@exception_view_config(PredicateMismatch, path_info=r"^/(danger-)?api/")
+def forbidden_api(exc, request):
+    # If the forbidden error is for an API endpoint, return a JSON response
+    # instead of redirecting
+    return HTTPForbidden(
+        json={"message": "Access was denied to this resource."},
+        content_type="application/json",
+    )
 
 
 @view_config(context=DatabaseNotAvailableError)
@@ -246,7 +282,7 @@ def index(request):
 )
 def locale(request):
     try:
-        form = SetLocaleForm(locale_id=request.GET.getone("locale_id"))
+        form = SetLocaleForm(MultiDict({"locale_id": request.GET.getone("locale_id")}))
     except KeyError:
         raise HTTPBadRequest("Invalid amount of locale_id parameters provided")
 
@@ -288,12 +324,32 @@ def list_classifiers(request):
     has_translations=True,
 )
 def search(request):
+    ratelimiter = request.find_service(IRateLimiter, name="search", context=None)
     metrics = request.find_service(IMetricsService, context=None)
 
+    ratelimiter.hit(request.remote_addr)
+    if not ratelimiter.test(request.remote_addr):
+        metrics.increment("warehouse.search.ratelimiter.exceeded")
+        message = (
+            "Your search query could not be performed because there were too "
+            "many requests by the client."
+        )
+        _resets_in = ratelimiter.resets_in(request.remote_addr)
+        if _resets_in is not None:
+            _resets_in = max(1, int(_resets_in.total_seconds()))
+            message += f" Limit may reset in {_resets_in} seconds."
+        raise HTTPTooManyRequests(message)
+    metrics.increment("warehouse.search.ratelimiter.hit")
+
     querystring = request.params.get("q", "").replace("'", '"')
+    # Bail early for really long queries before ES raises an error
+    if len(querystring) > 1000:
+        metrics.increment("warehouse.views.search.error", tags=["error:query_too_long"])
+        raise HTTPRequestEntityTooLarge("Query string too long.")
+
     order = request.params.get("o", "")
     classifiers = request.params.getall("c")
-    query = get_es_query(request.es, querystring, order, classifiers)
+    query = get_opensearch_query(request.opensearch, querystring, order, classifiers)
 
     try:
         page_num = int(request.params.get("page", 1))
@@ -301,10 +357,10 @@ def search(request):
         raise HTTPBadRequest("'page' must be an integer.")
 
     try:
-        page = ElasticsearchPage(
+        page = OpenSearchPage(
             query, page=page_num, url_maker=paginate_url_factory(request)
         )
-    except elasticsearch.TransportError:
+    except opensearchpy.TransportError:
         metrics.increment("warehouse.views.search.error")
         raise HTTPServiceUnavailable
 
@@ -317,8 +373,8 @@ def search(request):
         request.db.query(Classifier)
         .with_entities(Classifier.classifier)
         .filter(
-            exists([release_classifiers.c.trove_id]).where(
-                release_classifiers.c.trove_id == Classifier.id
+            exists(ReleaseClassifiers.trove_id).where(
+                ReleaseClassifiers.trove_id == Classifier.id
             ),
             Classifier.classifier.notin_(deprecated_classifiers.keys()),
         )
@@ -446,11 +502,6 @@ class SecurityKeyGiveaway:
 
     @view_config(request_method="GET")
     def security_key_giveaway(self):
-        if not self.request.registry.settings.get(
-            "warehouse.two_factor_mandate.available"
-        ):
-            raise HTTPNotFound
-
         return self.default_response
 
 
@@ -501,7 +552,7 @@ def sidebar_sponsor_logo(request):
 def health(request):
     # This will ensure that we can access the database and run queries against
     # it without doing anything that will take a lock or block other queries.
-    request.db.execute("SELECT 1")
+    request.db.execute(text("SELECT 1"))
 
     # Nothing will actually check this, but it's a little nicer to have
     # something to return besides an empty body.

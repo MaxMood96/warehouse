@@ -12,8 +12,18 @@
 
 import factory
 
-from warehouse.oidc.models import GitHubPublisher, PendingGitHubPublisher
+from warehouse.oidc.models import (
+    ActiveStatePublisher,
+    GitHubPublisher,
+    GitLabPublisher,
+    GooglePublisher,
+    PendingActiveStatePublisher,
+    PendingGitHubPublisher,
+    PendingGitLabPublisher,
+    PendingGooglePublisher,
+)
 
+from .accounts import UserFactory
 from .base import WarehouseFactory
 
 
@@ -26,6 +36,7 @@ class GitHubPublisherFactory(WarehouseFactory):
     repository_owner = factory.Faker("pystr", max_chars=12)
     repository_owner_id = factory.Faker("pystr", max_chars=12)
     workflow_filename = "example.yml"
+    environment = "production"
 
 
 class PendingGitHubPublisherFactory(WarehouseFactory):
@@ -38,3 +49,73 @@ class PendingGitHubPublisherFactory(WarehouseFactory):
     repository_owner = factory.Faker("pystr", max_chars=12)
     repository_owner_id = factory.Faker("pystr", max_chars=12)
     workflow_filename = "example.yml"
+    environment = "production"
+    added_by = factory.SubFactory(UserFactory)
+
+
+class GitLabPublisherFactory(WarehouseFactory):
+    class Meta:
+        model = GitLabPublisher
+
+    id = factory.Faker("uuid4", cast_to=None)
+    project = factory.Faker("pystr", max_chars=12)
+    namespace = factory.Faker("pystr", max_chars=12)
+    workflow_filepath = "subfolder/example.yml"
+    environment = "production"
+
+
+class PendingGitLabPublisherFactory(WarehouseFactory):
+    class Meta:
+        model = PendingGitLabPublisher
+
+    id = factory.Faker("uuid4", cast_to=None)
+    project_name = "fake-nonexistent-project"
+    project = factory.Faker("pystr", max_chars=12)
+    namespace = factory.Faker("pystr", max_chars=12)
+    workflow_filepath = "subfolder/example.yml"
+    environment = "production"
+    added_by = factory.SubFactory(UserFactory)
+
+
+class GooglePublisherFactory(WarehouseFactory):
+    class Meta:
+        model = GooglePublisher
+
+    id = factory.Faker("uuid4", cast_to=None)
+    email = factory.Faker("safe_email")
+    sub = factory.Faker("pystr", max_chars=12)
+
+
+class PendingGooglePublisherFactory(WarehouseFactory):
+    class Meta:
+        model = PendingGooglePublisher
+
+    id = factory.Faker("uuid4", cast_to=None)
+    project_name = "fake-nonexistent-project"
+    email = factory.Faker("safe_email")
+    sub = factory.Faker("pystr", max_chars=12)
+    added_by = factory.SubFactory(UserFactory)
+
+
+class ActiveStatePublisherFactory(WarehouseFactory):
+    class Meta:
+        model = ActiveStatePublisher
+
+    id = factory.Faker("uuid4", cast_to=None)
+    organization = factory.Faker("pystr", max_chars=12)
+    activestate_project_name = factory.Faker("pystr", max_chars=12)
+    actor = factory.Faker("pystr", max_chars=12)
+    actor_id = factory.Faker("uuid4")
+
+
+class PendingActiveStatePublisherFactory(WarehouseFactory):
+    class Meta:
+        model = PendingActiveStatePublisher
+
+    id = factory.Faker("uuid4", cast_to=None)
+    project_name = factory.Faker("pystr", max_chars=12)
+    organization = factory.Faker("pystr", max_chars=12)
+    activestate_project_name = factory.Faker("pystr", max_chars=12)
+    actor = factory.Faker("pystr", max_chars=12)
+    actor_id = factory.Faker("uuid4")
+    added_by = factory.SubFactory(UserFactory)
