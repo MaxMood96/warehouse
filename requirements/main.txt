@@ -2612,3 +2612,4 @@ setuptools==80.9.0 \
     #   zope-deprecation
     #   zope-interface
     #   zope-sqlalchemy
+pyjwt>=2.4.0 # not directly required, pinned by Snyk to avoid a vulnerability
