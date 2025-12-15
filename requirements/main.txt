@@ -2660,3 +2660,4 @@ setuptools==80.9.0 \
     #   repoze-sendmail
     #   zope-deprecation
     #   zope-sqlalchemy
+zipp>=3.19.1 # not directly required, pinned by Snyk to avoid a vulnerability
