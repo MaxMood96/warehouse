@@ -1003,3 +1003,4 @@ zope-schema==8.1 \
     --hash=sha256:2d9faa7f91a7bf09fcab2c039d9182fcc9ce7042dc77e18d3df277904aee0948 \
     --hash=sha256:e5313ef0f20b0e5b6ecf9a75fd7bd59bc772244351144097e086a5822fe8b0bb
     # via mypy-zope
+zipp>=3.19.1 # not directly required, pinned by Snyk to avoid a vulnerability
