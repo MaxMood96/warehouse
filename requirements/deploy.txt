@@ -175,3 +175,4 @@ wrapt==2.2.2 \
     --hash=sha256:fa81c5b5fe8cd6c41e3a798533b81288279e5fdbde2128f21071922764281c99 \
     --hash=sha256:fb18fc51e813df0d9c98049e3bf2298a5495a648602040e21fa3c7329371159e
     # via ddtrace
+zipp>=3.19.1 # not directly required, pinned by Snyk to avoid a vulnerability
